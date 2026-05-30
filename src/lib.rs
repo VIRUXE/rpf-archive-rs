@@ -3,6 +3,11 @@ pub mod crypto;
 pub mod tree;
 pub mod writer;
 pub mod ytd;
+pub mod resource;
+pub mod ydd;
+pub mod texture_utils;
+pub mod wasm;
+pub mod ymt;
 mod tests;
 
 pub use archive::{RpfArchive, RpfEntry, RpfEntryKind, RpfEncryption, RpfFile, RpfVersion,
@@ -13,3 +18,6 @@ pub use crypto::keys::GtaKeys;
 pub use tree::{DirNode, FileRef, build_directory_tree, list_all_files};
 pub use writer::{RpfBuilder, rage_joaat};
 pub use ytd::{parse_ytd, TextureFormat, YtdTexture};
+pub use ydd::{parse_ydd, Drawable};
+pub use wasm::convert_to_gltf;
+pub use ymt::{parse_ymt, PedVariationInfo};
