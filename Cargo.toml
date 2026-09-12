@@ -1,6 +1,6 @@
 [package]
 name = "rpf-archive"
-version = "0.7.2"
+version = "0.7.3"
 edition = "2021"
 description = "Rockstar Package File (RPF) archive library — read and write RPF0–RPF8, IMG1, IMG2, and IMG3 across GTA, RDR, and related titles"
 license = "Unlicense"
