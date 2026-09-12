@@ -1,11 +1,8 @@
 /// YTD (Texture Dictionary) parser for GTA V (Gen8 / PC format).
 ///
 /// Accepts the standalone RSC7 bytes as returned by `RpfArchive::extract_entry`.
-use anyhow::{bail, Context, Result};
-use flate2::read::DeflateDecoder;
-use std::io::Read;
-
-use crate::archive::{resource_size_from_flags, RSC7_MAGIC};
+use anyhow::{Result, Context};
+use crate::resource::{ResReader, prepare_rsc7, u16_le, u32_le, u64_le};
 
 // ─── Public types ─────────────────────────────────────────────────────────────
 
@@ -122,9 +119,6 @@ impl YtdTexture {
 
         // Pixel data
         if self.format == TextureFormat::BC7 {
-            // Prepend DX10 extension header after pixel format signals DX10
-            // Note: the DX10 header is placed before pixel data but after DDS_HEADER
-            // The FourCC "DX10" in the pixelformat signals this header follows
             write_dx10_header(&mut out);
         }
         out.extend_from_slice(&self.pixel_data);
@@ -148,58 +142,14 @@ impl YtdTexture {
             }
             TextureFormat::A8R8G8B8 => {
                 out.extend_from_slice(&(0x1 | 0x40u32).to_le_bytes()); // ALPHAPIXELS | RGB
-                out.extend_from_slice(&0u32.to_le_bytes()); // no FourCC
-                out.extend_from_slice(&32u32.to_le_bytes()); // bit count
-                out.extend_from_slice(&0x00FF0000u32.to_le_bytes()); // R
-                out.extend_from_slice(&0x0000FF00u32.to_le_bytes()); // G
-                out.extend_from_slice(&0x000000FFu32.to_le_bytes()); // B
-                out.extend_from_slice(&0xFF000000u32.to_le_bytes()); // A
+                out.extend_from_slice(&[0u8; 4]); // FourCC = 0
+                out.extend_from_slice(&32u32.to_le_bytes()); // dwRGBBitCount
+                out.extend_from_slice(&0x00FF0000u32.to_le_bytes()); // RMask
+                out.extend_from_slice(&0x0000FF00u32.to_le_bytes()); // GMask
+                out.extend_from_slice(&0x000000FFu32.to_le_bytes()); // BMask
+                out.extend_from_slice(&0xFF000000u32.to_le_bytes()); // AMask
             }
-            TextureFormat::X8R8G8B8 => {
-                out.extend_from_slice(&0x40u32.to_le_bytes()); // RGB
-                out.extend_from_slice(&0u32.to_le_bytes());
-                out.extend_from_slice(&32u32.to_le_bytes());
-                out.extend_from_slice(&0x00FF0000u32.to_le_bytes());
-                out.extend_from_slice(&0x0000FF00u32.to_le_bytes());
-                out.extend_from_slice(&0x000000FFu32.to_le_bytes());
-                out.extend_from_slice(&0u32.to_le_bytes()); // no alpha
-            }
-            TextureFormat::A8B8G8R8 => {
-                out.extend_from_slice(&(0x1 | 0x40u32).to_le_bytes());
-                out.extend_from_slice(&0u32.to_le_bytes());
-                out.extend_from_slice(&32u32.to_le_bytes());
-                out.extend_from_slice(&0x000000FFu32.to_le_bytes()); // R
-                out.extend_from_slice(&0x0000FF00u32.to_le_bytes()); // G
-                out.extend_from_slice(&0x00FF0000u32.to_le_bytes()); // B
-                out.extend_from_slice(&0xFF000000u32.to_le_bytes()); // A
-            }
-            TextureFormat::A1R5G5B5 => {
-                out.extend_from_slice(&(0x1 | 0x40u32).to_le_bytes());
-                out.extend_from_slice(&0u32.to_le_bytes());
-                out.extend_from_slice(&16u32.to_le_bytes());
-                out.extend_from_slice(&0x7C00u32.to_le_bytes()); // R (5 bits)
-                out.extend_from_slice(&0x03E0u32.to_le_bytes()); // G (5 bits)
-                out.extend_from_slice(&0x001Fu32.to_le_bytes()); // B (5 bits)
-                out.extend_from_slice(&0x8000u32.to_le_bytes()); // A (1 bit)
-            }
-            TextureFormat::A8 => {
-                out.extend_from_slice(&0x2u32.to_le_bytes()); // ALPHA
-                out.extend_from_slice(&0u32.to_le_bytes());
-                out.extend_from_slice(&8u32.to_le_bytes());
-                out.extend_from_slice(&[0u8; 16]);
-                // alpha mask is last u32 — overwrite last 4 bytes
-                let len = out.len();
-                out[len - 4..len].copy_from_slice(&0xFFu32.to_le_bytes());
-            }
-            TextureFormat::L8 => {
-                out.extend_from_slice(&0x20000u32.to_le_bytes()); // LUMINANCE
-                out.extend_from_slice(&0u32.to_le_bytes());
-                out.extend_from_slice(&8u32.to_le_bytes());
-                out.extend_from_slice(&0xFFu32.to_le_bytes()); // R mask
-                out.extend_from_slice(&[0u8; 12]);
-            }
-            TextureFormat::Unknown => {
-                // best-effort fallback: write empty pixelformat
+            _ => {
                 out.extend_from_slice(&[0u8; 28]);
             }
         }
@@ -216,131 +166,31 @@ fn write_dx10_header(out: &mut Vec<u8>) {
 
 // ─── Parser ───────────────────────────────────────────────────────────────────
 
-/// Parse a YTD file from standalone RSC7 bytes.
-///
-/// `data` is the output of `RpfArchive::extract_entry` for a `.ytd` entry.
 pub fn parse_ytd(data: &[u8]) -> Result<Vec<YtdTexture>> {
-    if data.len() < 16 {
-        bail!("YTD data too short");
-    }
-
-    let magic = u32::from_le_bytes(data[0..4].try_into().unwrap());
-    if magic != RSC7_MAGIC {
-        bail!("Not an RSC7 file (magic = 0x{:08X})", magic);
-    }
-
-    let system_flags  = u32::from_le_bytes(data[8..12].try_into().unwrap());
-    let graphics_flags = u32::from_le_bytes(data[12..16].try_into().unwrap());
-
-    let sys_size  = resource_size_from_flags(system_flags);
-    let gfx_size  = resource_size_from_flags(graphics_flags);
-    let body      = &data[16..];
-
-    // Decompress
-    let decompressed = {
-        let mut out = Vec::new();
-        if DeflateDecoder::new(body).read_to_end(&mut out).is_ok() && !out.is_empty() {
-            out
-        } else {
-            // Try raw (uncompressed) body
-            body.to_vec()
-        }
-    };
-
-    if decompressed.len() < sys_size {
-        bail!(
-            "Decompressed size {} < expected system size {}",
-            decompressed.len(), sys_size
-        );
-    }
-
-    let system   = &decompressed[..sys_size];
-    let graphics = if decompressed.len() >= sys_size + gfx_size {
-        &decompressed[sys_size..sys_size + gfx_size]
-    } else {
-        &decompressed[sys_size..]
-    };
-
-    let reader = ResReader { system, graphics };
+    let (system, graphics) = prepare_rsc7(data)?;
+    let reader = ResReader { system: &system, graphics: &graphics };
     parse_texture_dict(&reader)
 }
-
-// ─── Internal virtual-memory reader ──────────────────────────────────────────
-
-struct ResReader<'a> {
-    system:   &'a [u8],
-    graphics: &'a [u8],
-}
-
-impl<'a> ResReader<'a> {
-    fn resolve(&self, va: u64, len: usize) -> Option<&'a [u8]> {
-        if va == 0 { return None; }
-        if (va & 0x50000000) == 0x50000000 && (va & 0x60000000) != 0x60000000 {
-            let off = (va - 0x50000000) as usize;
-            self.system.get(off..off + len)
-        } else if (va & 0x60000000) == 0x60000000 {
-            let off = (va - 0x60000000) as usize;
-            self.graphics.get(off..off + len)
-        } else {
-            None
-        }
-    }
-
-    fn string_at(&self, va: u64) -> Option<String> {
-        if (va & 0x50000000) == 0x50000000 && (va & 0x60000000) != 0x60000000 {
-            let off = (va - 0x50000000) as usize;
-            let slice = self.system.get(off..)?;
-            let end = slice.iter().position(|&b| b == 0).unwrap_or(slice.len());
-            Some(String::from_utf8_lossy(&slice[..end]).into_owned())
-        } else {
-            None
-        }
-    }
-}
-
-// ─── Struct parsing helpers ───────────────────────────────────────────────────
-
-fn u16_le(b: &[u8], off: usize) -> u16 {
-    u16::from_le_bytes(b[off..off + 2].try_into().unwrap())
-}
-fn u32_le(b: &[u8], off: usize) -> u32 {
-    u32::from_le_bytes(b[off..off + 4].try_into().unwrap())
-}
-fn u64_le(b: &[u8], off: usize) -> u64 {
-    u64::from_le_bytes(b[off..off + 8].try_into().unwrap())
-}
-
-// ─── TextureDictionary ────────────────────────────────────────────────────────
 
 fn parse_texture_dict(reader: &ResReader<'_>) -> Result<Vec<YtdTexture>> {
     let sys = reader.system;
     if sys.len() < 64 {
-        bail!("system section too small for TextureDictionary");
+        return Err(anyhow::anyhow!("system section too small for TextureDictionary"));
     }
 
-    // ResourceFileBase at 0x00 (16 bytes): VFT, FileUnknown, FilePagesInfoPointer
-    // TextureDictionary fields at 0x10:
-    // 0x10..0x1F: four u32 unknowns
-    // 0x20: ResourceSimpleList64_uint (TextureNameHashes) — 16 bytes
     let hash_ptr   = u64_le(sys, 0x20);
-    let hash_count = u32_le(sys, 0x28) as usize;
-    // capacity at 0x2C
-
-    // 0x30: ResourcePointerList64<Texture> (Textures) — 16 bytes
+    let hash_count = u16_le(sys, 0x28) as usize;
     let tex_ptr_array = u64_le(sys, 0x30);
-    let tex_count     = u32_le(sys, 0x38) as usize;
+    let tex_count     = u16_le(sys, 0x38) as usize;
 
-    // Read name hashes (u32 array in system section)
     let hash_data = if hash_count > 0 {
         reader.resolve(hash_ptr, hash_count * 4)
     } else {
         None
     };
 
-    // Read texture pointer array (u64 per texture, in system section)
-    let ptr_bytes = tex_count * 8;
     let ptr_data = if tex_count > 0 {
-        reader.resolve(tex_ptr_array, ptr_bytes)
+        reader.resolve(tex_ptr_array, tex_count * 8)
             .with_context(|| format!("texture pointer array out of bounds (va=0x{:X})", tex_ptr_array))?
     } else {
         return Ok(vec![]);
@@ -366,14 +216,10 @@ fn parse_texture_dict(reader: &ResReader<'_>) -> Result<Vec<YtdTexture>> {
 }
 
 fn parse_texture(tex_va: u64, name_hash: u32, reader: &ResReader<'_>) -> Result<YtdTexture> {
-    // Texture struct is 144 bytes (0x90) in the system section
     let raw = reader.resolve(tex_va, 0x90)
         .with_context(|| format!("texture struct out of bounds (va=0x{:X})", tex_va))?;
 
-    // TextureBase fields (offset within Texture struct)
     let name_ptr = u64_le(raw, 0x28);
-
-    // Texture-specific fields (starting at 0x50)
     let width  = u16_le(raw, 0x50);
     let height = u16_le(raw, 0x52);
     let depth  = u16_le(raw, 0x54);
@@ -383,8 +229,6 @@ fn parse_texture(tex_va: u64, name_hash: u32, reader: &ResReader<'_>) -> Result<
     let data_ptr = u64_le(raw, 0x70);
 
     let name = reader.string_at(name_ptr).unwrap_or_default();
-
-    // Compute pixel data size (same formula as CodeWalker TextureData.Read)
     let pixel_size = calc_pixel_data_size(stride, height, levels);
 
     let pixel_data = if pixel_size > 0 && data_ptr != 0 {
