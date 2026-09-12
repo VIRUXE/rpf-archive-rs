@@ -49,16 +49,64 @@ pub fn decompress_texture(texture: &YtdTexture) -> Result<Vec<u8>> {
         _ => bail!("Unsupported texture format for decompression: {:?}", texture.format),
     }
 
-    // Convert u32 (presumably ABGR or ARGB) to Vec<u8> RGBA
-    // We need to check what texture2ddecoder returns. Usually it's 0xAABBGGRR or 0xAARRGGBB.
-    // Assuming it's 0xAABBGGRR (standard for many decoders)
+    // texture2ddecoder packs each pixel as 0xAARRGGBB, so red is the high
+    // colour byte and blue the low one. Reading them the other way round
+    // renders the game's reds as blues.
     let mut rgba_u8 = Vec::with_capacity(width * height * 4);
     for pixel in rgba_u32 {
-        rgba_u8.push((pixel & 0xFF) as u8);         // R
+        rgba_u8.push(((pixel >> 16) & 0xFF) as u8); // R
         rgba_u8.push(((pixel >> 8) & 0xFF) as u8);  // G
-        rgba_u8.push(((pixel >> 16) & 0xFF) as u8); // B
+        rgba_u8.push((pixel & 0xFF) as u8);         // B
         rgba_u8.push(((pixel >> 24) & 0xFF) as u8); // A
     }
     
     Ok(rgba_u8)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn texture(format: TextureFormat, pixel_data: Vec<u8>) -> YtdTexture {
+        YtdTexture {
+            name: "test".into(),
+            name_hash: 0,
+            width: 4,
+            height: 4,
+            depth: 1,
+            format,
+            levels: 1,
+            stride: 0,
+            pixel_data,
+        }
+    }
+
+    /// A DXT1 block whose every texel is pure red must decode to pure red,
+    /// not pure blue — the channel order is easy to get backwards.
+    #[test]
+    fn block_compressed_red_stays_red() {
+        // color0 = 0xF800 (R=31, G=0, B=0), color1 = 0x0000, all indices 0.
+        let block = vec![0x00, 0xF8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+        let rgba = decompress_texture(&texture(TextureFormat::DXT1, block)).unwrap();
+
+        assert_eq!(rgba.len(), 4 * 4 * 4);
+        for texel in rgba.chunks_exact(4) {
+            assert_eq!(texel[0], 255, "red channel");
+            assert_eq!(texel[1], 0, "green channel");
+            assert_eq!(texel[2], 0, "blue channel");
+            assert_eq!(texel[3], 255, "alpha channel");
+        }
+    }
+
+    #[test]
+    fn uncompressed_argb_is_reordered() {
+        // One BGRA-ordered texel on disk: B=0x11, G=0x22, R=0x33, A=0x44.
+        let rgba = decompress_texture(&texture(
+            TextureFormat::A8R8G8B8,
+            vec![0x11, 0x22, 0x33, 0x44],
+        ))
+        .unwrap();
+
+        assert_eq!(rgba, vec![0x33, 0x22, 0x11, 0x44]);
+    }
 }
