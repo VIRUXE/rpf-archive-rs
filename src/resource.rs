@@ -1,4 +1,4 @@
-use anyhow::{bail, Result, Context};
+use anyhow::{bail, Result};
 use flate2::read::DeflateDecoder;
 use std::io::Read;
 use crate::archive::{resource_size_from_flags, RSC7_MAGIC};
