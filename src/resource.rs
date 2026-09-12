@@ -64,14 +64,23 @@ pub fn prepare_rsc7(data: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> {
     let gfx_size  = resource_size_from_flags(graphics_flags);
     let body      = &data[16..];
 
-    // Decompress
+    // Most resources are deflated, but a few are stored raw. Telling the two
+    // apart by whether inflate succeeds is fine; what matters is not confusing
+    // a *corrupt* stream for a stored one, because feeding the still-compressed
+    // bytes on as though they were the resource produces wild pointers far
+    // downstream instead of naming the real problem here.
     let decompressed = {
         let mut out = Vec::new();
-        if DeflateDecoder::new(body).read_to_end(&mut out).is_ok() && !out.is_empty() {
-            out
-        } else {
-            // Try raw (uncompressed) body
-            body.to_vec()
+        match DeflateDecoder::new(body).read_to_end(&mut out) {
+            Ok(_) if !out.is_empty() => out,
+            Ok(_) => body.to_vec(),
+            // Never looked like deflate at all — treat it as stored.
+            Err(_) if out.is_empty() => body.to_vec(),
+            Err(_) => bail!(
+                "corrupt deflate stream: inflated {} of an expected {} bytes before failing",
+                out.len(),
+                sys_size + gfx_size
+            ),
         }
     };
 
