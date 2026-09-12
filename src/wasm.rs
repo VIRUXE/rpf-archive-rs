@@ -23,7 +23,7 @@ fn inner_convert(ydd_bytes: &[u8], ytd_bytes: &[u8]) -> Result<Vec<u8>> {
     let root = json::object! {
         "asset": {
             "version": "2.0",
-            "generator": "rpf-rs-wasm"
+            "generator": "rpf-archive-wasm"
         },
         "extensions": {
             "gta_metadata": {
