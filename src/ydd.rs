@@ -1410,14 +1410,16 @@ impl Drawable {
         self.texture_parameter(shader_id, DIFFUSE_SAMPLER)
     }
 
-    /// The drawable's stored bounds, or — when those are degenerate (empty,
-    /// non-finite or radius-less) — bounds rebuilt from the LOD's vertices.
-    /// The flag says which of the two was returned.
+    /// Bounds rebuilt from the LOD's vertices, falling back to the drawable's
+    /// stored bounds when it has no usable vertices. The flag says which of
+    /// the two was returned.
+    ///
+    /// The stored bounds are not trusted for framing: on skinned drawables
+    /// (ped components, for one) they are the skeleton's bounds, several times
+    /// the size of the part itself and centred elsewhere, so a camera fitted
+    /// to them shrinks the model to a speck or misses it altogether. The
+    /// vertices are what actually gets drawn, so they decide the frame.
     pub fn bounds_or_computed(&self, lod: &DrawableLod) -> (DrawableBounds, bool) {
-        if !bounds_are_degenerate(&self.bounds) {
-            return (self.bounds.clone(), false);
-        }
-
         let mut min = Vec3::new(f32::INFINITY, f32::INFINITY, f32::INFINITY);
         let mut max = Vec3::new(f32::NEG_INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY);
         let mut seen = false;
@@ -1438,7 +1440,7 @@ impl Drawable {
             }
         }
 
-        if !seen {
+        if !seen || min == max {
             return (self.bounds.clone(), false);
         }
 
@@ -1485,16 +1487,6 @@ impl Drawable {
             .map(|model| model.geometries.len())
             .sum()
     }
-}
-
-fn bounds_are_degenerate(bounds: &DrawableBounds) -> bool {
-    let finite = |v: Vec3| v.x.is_finite() && v.y.is_finite() && v.z.is_finite();
-
-    !finite(bounds.box_min)
-        || !finite(bounds.box_max)
-        || bounds.box_min == bounds.box_max
-        || bounds.sphere_radius.is_nan()
-        || bounds.sphere_radius <= 0.0
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────────────
@@ -1769,6 +1761,36 @@ pub(crate) mod tests {
         assert_eq!(bounds.center, Vec3::new(4.0, 5.0, 6.0));
         let expected_radius = (108.0f32).sqrt() / 2.0;
         assert!((bounds.sphere_radius - expected_radius).abs() < 1e-5);
+    }
+
+    /// Skinned drawables (ped components) store the *skeleton's* bounds, which
+    /// are far larger than the part and centred elsewhere. Framing by them left
+    /// the component a speck in the corner, or off-frame entirely, so the
+    /// vertices must win even when the stored bounds look perfectly valid.
+    #[test]
+    fn oversized_stored_bounds_lose_to_the_vertices() {
+        let (mut system, graphics) = minimal_ydr_sections(false);
+        // A plausible but much too large stored box, centred away from the mesh.
+        write_f32(&mut system, 0x20, 0.0);
+        write_f32(&mut system, 0x24, 0.0);
+        write_f32(&mut system, 0x28, 50.0);
+        write_f32(&mut system, 0x2C, 100.0);
+        write_f32(&mut system, 0x30, -100.0);
+        write_f32(&mut system, 0x34, -100.0);
+        write_f32(&mut system, 0x38, -50.0);
+        write_f32(&mut system, 0x40, 100.0);
+        write_f32(&mut system, 0x44, 100.0);
+        write_f32(&mut system, 0x48, 150.0);
+
+        let reader = sections_reader(&system, &graphics);
+        let drawable = parse_drawable_at(&reader, SYSTEM_BASE, 0xA8, 0xD0, None).unwrap();
+        assert_eq!(drawable.bounds.sphere_radius, 100.0);
+
+        let lod = drawable.best_lod().unwrap();
+        let (bounds, computed) = drawable.bounds_or_computed(lod);
+        assert!(computed, "vertex bounds should win over the stored ones");
+        assert_eq!(bounds.box_min, Vec3::new(1.0, 2.0, 3.0));
+        assert_eq!(bounds.box_max, Vec3::new(7.0, 8.0, 9.0));
     }
 
     #[test]
