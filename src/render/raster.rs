@@ -98,7 +98,12 @@ pub(crate) fn draw_geometry(
         let (v0, v1, v2) = if area < 0.0 { (a, c, b) } else { (a, b, c) };
 
         // Only |dot(n, light)| is used, so the face normal's sign is irrelevant.
-        let face_normal = (b.world - a.world).cross(c.world - a.world).normalize();
+        // A degenerate triangle in world space (zero-length cross product) has
+        // no usable normal, and is left unshaded rather than shaded as if it
+        // faced edge-on to the light.
+        let cross = (b.world - a.world).cross(c.world - a.world);
+        let face_normal =
+            (cross.length() > 1e-12).then(|| cross.normalize());
 
         raster_triangle(fb, g, o, [v0, v1, v2], area.abs(), face_normal, light);
     }
@@ -111,7 +116,7 @@ fn raster_triangle(
     o: &RenderOptions,
     v: [Projected; 3],
     area: f32,
-    face_normal: Vec3,
+    face_normal: Option<Vec3>,
     light: Vec3,
 ) {
     let width = fb.color.width() as i64;
@@ -192,16 +197,21 @@ fn raster_triangle(
 
             if o.lighting {
                 let normal = if g.has_normals {
-                    Vec3::new(
+                    let interpolated = Vec3::new(
                         l[0] * v[0].normal.x + l[1] * v[1].normal.x + l[2] * v[2].normal.x,
                         l[0] * v[0].normal.y + l[1] * v[1].normal.y + l[2] * v[2].normal.y,
                         l[0] * v[0].normal.z + l[1] * v[1].normal.z + l[2] * v[2].normal.z,
-                    )
-                    .normalize()
+                    );
+                    (interpolated.length() > 1e-12).then(|| interpolated.normalize())
                 } else {
                     face_normal
                 };
-                let k = 0.45 + 0.55 * normal.dot(light).abs();
+                // No usable normal: leave the texel at full brightness rather
+                // than darkening it with a meaningless dot product.
+                let k = match normal {
+                    Some(normal) => 0.45 + 0.55 * normal.dot(light).abs(),
+                    None => 1.0,
+                };
                 texel[0] *= k;
                 texel[1] *= k;
                 texel[2] *= k;
@@ -240,11 +250,15 @@ fn edge(a: Projected, b: Projected, x: f32, y: f32) -> f32 {
 
 /// Pixels exactly on an edge belong to the triangle only when that edge is a
 /// top or left edge, so shared edges are drawn once.
+///
+/// With the winding normalized so the edge functions are positive inside, and
+/// screen y growing downward, a triangle's top edge runs left-to-right
+/// (`dy == 0 && dx > 0`) and its left edge runs upward (`dy < 0`).
 #[inline]
 fn top_left_bias(a: Projected, b: Projected) -> bool {
     let dx = b.x - a.x;
     let dy = b.y - a.y;
-    dy > 0.0 || (dy == 0.0 && dx < 0.0)
+    dy < 0.0 || (dy == 0.0 && dx > 0.0)
 }
 
 #[inline]
@@ -351,16 +365,22 @@ mod tests {
         RgbaImage::from_pixel(1, 1, image::Rgba(colour))
     }
 
-    /// A screen-filling, counter-clockwise (front-facing) quad in NDC, used
-    /// with an identity view-projection. `v` grows downward on screen.
-    fn ndc_quad(z: f32) -> (Vec<UnifiedVertex>, Vec<u32>) {
+    /// A counter-clockwise (front-facing) quad in NDC spanning `x0..x1`
+    /// horizontally and the full height, used with an identity
+    /// view-projection. `v` grows downward on screen.
+    fn ndc_quad_x(x0: f32, x1: f32, z: f32) -> (Vec<UnifiedVertex>, Vec<u32>) {
         let verts = vec![
-            vertex(Vec3::new(-1.0, -1.0, z), Vec2::new(0.0, 1.0)),
-            vertex(Vec3::new(1.0, -1.0, z), Vec2::new(1.0, 1.0)),
-            vertex(Vec3::new(1.0, 1.0, z), Vec2::new(1.0, 0.0)),
-            vertex(Vec3::new(-1.0, 1.0, z), Vec2::new(0.0, 0.0)),
+            vertex(Vec3::new(x0, -1.0, z), Vec2::new(0.0, 1.0)),
+            vertex(Vec3::new(x1, -1.0, z), Vec2::new(1.0, 1.0)),
+            vertex(Vec3::new(x1, 1.0, z), Vec2::new(1.0, 0.0)),
+            vertex(Vec3::new(x0, 1.0, z), Vec2::new(0.0, 0.0)),
         ];
         (verts, vec![0, 1, 2, 0, 2, 3])
+    }
+
+    /// A screen-filling, front-facing quad in NDC.
+    fn ndc_quad(z: f32) -> (Vec<UnifiedVertex>, Vec<u32>) {
+        ndc_quad_x(-1.0, 1.0, z)
     }
 
     fn bounds() -> DrawableBounds {
@@ -490,6 +510,96 @@ mod tests {
         draw_geometry(&mut fb, &geometry, &Mat4::identity(), Vec3::Z, &options);
 
         assert!(fb.color.pixels().all(|p| p.0 == BACKGROUND));
+    }
+
+    /// The pixel whose centre sits exactly on a shared vertical edge belongs
+    /// to the triangle that has it as a *left* edge — the right-hand quad —
+    /// whichever order the two are drawn in.
+    #[test]
+    fn shared_edge_belongs_to_the_left_edge_under_the_top_left_rule() {
+        let options = flat_options();
+        let red = solid([255, 0, 0, 255]);
+        let blue = solid([0, 0, 255, 255]);
+
+        // Pixel 32's centre is at screen x = 32.5; put the shared edge there.
+        let seam = 2.0 * 32.5 / options.width as f32 - 1.0;
+        let (left_verts, indices) = ndc_quad_x(-1.0, seam, 0.0);
+        let (right_verts, _) = ndc_quad_x(seam, 1.0, 0.0);
+
+        let left = PreparedGeometry {
+            verts: left_verts,
+            indices: indices.clone(),
+            texture: Some(&red),
+            has_normals: false,
+            alpha_cutout: false,
+        };
+        let right = PreparedGeometry {
+            verts: right_verts,
+            indices,
+            texture: Some(&blue),
+            has_normals: false,
+            alpha_cutout: false,
+        };
+
+        let identity = Mat4::identity();
+        for (first, second) in [(&left, &right), (&right, &left)] {
+            let mut fb = Framebuffer::new(options.width, options.height, options.background);
+            draw_geometry(&mut fb, first, &identity, Vec3::Z, &options);
+            draw_geometry(&mut fb, second, &identity, Vec3::Z, &options);
+
+            assert_eq!(
+                fb.color.get_pixel(32, 32).0,
+                [0, 0, 255, 255],
+                "the seam pixel belongs to the right-hand quad"
+            );
+            assert_eq!(fb.color.get_pixel(31, 32).0, [255, 0, 0, 255]);
+            assert_eq!(fb.color.get_pixel(33, 32).0, [0, 0, 255, 255]);
+        }
+    }
+
+    #[test]
+    fn backface_culling_keeps_forward_winding() {
+        let options = RenderOptions { backface_cull: true, ..flat_options() };
+        let (verts, indices) = ndc_quad(0.0);
+
+        let geometry = PreparedGeometry {
+            verts,
+            indices,
+            texture: None,
+            has_normals: false,
+            alpha_cutout: false,
+        };
+
+        let mut fb = Framebuffer::new(options.width, options.height, options.background);
+        draw_geometry(&mut fb, &geometry, &Mat4::identity(), Vec3::Z, &options);
+        assert!(fb.color.pixels().all(|p| p.0 != BACKGROUND));
+    }
+
+    #[test]
+    fn degenerate_world_triangle_is_not_darkened() {
+        let options = RenderOptions { lighting: true, ..flat_options() };
+        let white = solid([255, 255, 255, 255]);
+
+        // A quad whose world positions are all in one line has no face normal,
+        // yet still covers pixels once projected.
+        let mut verts = ndc_quad(0.0).0;
+        for vertex in verts.iter_mut() {
+            vertex.position.z = 0.0;
+            vertex.position.y = vertex.position.x;
+        }
+        let geometry = PreparedGeometry {
+            verts,
+            indices: vec![0, 1, 2, 0, 2, 3],
+            texture: Some(&white),
+            has_normals: false,
+            alpha_cutout: false,
+        };
+
+        let mut fb = Framebuffer::new(options.width, options.height, options.background);
+        draw_geometry(&mut fb, &geometry, &Mat4::identity(), Vec3::Z, &options);
+        // Nothing is drawn (the triangles are degenerate in screen space too)
+        // or, where it is, it is not darkened to black.
+        assert!(fb.color.pixels().all(|p| p.0 == BACKGROUND || p.0[0] > 200));
     }
 
     #[test]

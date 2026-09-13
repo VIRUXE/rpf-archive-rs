@@ -337,8 +337,9 @@ mod tests {
         vec![0, 1, 2, 0, 2, 3]
     }
 
-    /// A unit cube centred on the origin, with per-face outward normals.
-    fn cube_drawable() -> Drawable {
+    /// An axis-aligned box centred on the origin, with per-face outward
+    /// normals. `half_extents` of 0.5 on every axis gives the unit cube.
+    fn box_drawable(half_extents: Vec3) -> Drawable {
         let faces: [(Vec3, Vec3, Vec3); 6] = [
             // (normal, u axis, v axis)
             (Vec3::new(0.0, -1.0, 0.0), Vec3::X, Vec3::Z),
@@ -367,7 +368,12 @@ mod tests {
                 Vec2::new(0.0, 0.0),
             ];
             for (corner, uv) in corners.iter().zip(uvs) {
-                vertices.push((*corner, normal, uv, [200, 180, 160, 255]));
+                let scaled = Vec3::new(
+                    corner.x * half_extents.x * 2.0,
+                    corner.y * half_extents.y * 2.0,
+                    corner.z * half_extents.z * 2.0,
+                );
+                vertices.push((scaled, normal, uv, [200, 180, 160, 255]));
             }
             indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
         }
@@ -382,6 +388,21 @@ mod tests {
 
     fn background_count(image: &image::RgbaImage, background: [u8; 4]) -> usize {
         image.pixels().filter(|p| p.0 == background).count()
+    }
+
+    /// Width / height of the bounding box of the non-background pixels.
+    fn silhouette_ratio(image: &image::RgbaImage, background: [u8; 4]) -> f32 {
+        let mut min = (u32::MAX, u32::MAX);
+        let mut max = (0u32, 0u32);
+        for (x, y, pixel) in image.enumerate_pixels() {
+            if pixel.0 == background {
+                continue;
+            }
+            min = (min.0.min(x), min.1.min(y));
+            max = (max.0.max(x), max.1.max(y));
+        }
+        assert!(min.0 <= max.0, "nothing was drawn");
+        (max.0 - min.0 + 1) as f32 / (max.1 - min.1 + 1) as f32
     }
 
     // ─── Tests ──────────────────────────────────────────────────────────────
@@ -427,9 +448,47 @@ mod tests {
         assert_eq!(centre[3], 255);
     }
 
+    /// A 1 x 2 x 3 box looks different from every side, so a swapped view
+    /// direction or up vector shows up as the wrong silhouette shape.
+    #[test]
+    fn views_show_the_expected_silhouette_of_an_asymmetric_box() {
+        let drawable = box_drawable(Vec3::new(0.5, 1.0, 1.5));
+        let options = options(256, 256);
+        let rendered =
+            render_views(&drawable, &TextureSet::new(), &options, &View::ALL).unwrap();
+
+        let ratio = |wanted: View| {
+            let (_, image, _) = rendered
+                .iter()
+                .find(|(view, _, _)| *view == wanted)
+                .expect("view rendered");
+            silhouette_ratio(image, options.background)
+        };
+
+        // Front/Back look along Y: X (1) wide by Z (3) tall.
+        // Left/Right look along X: Y (2) wide by Z (3) tall.
+        // Top looks down Z with +Y up: X (1) wide by Y (2) tall.
+        for (view, expected) in [
+            (View::Front, 1.0 / 3.0),
+            (View::Back, 1.0 / 3.0),
+            (View::Left, 2.0 / 3.0),
+            (View::Right, 2.0 / 3.0),
+            (View::Top, 1.0 / 2.0),
+        ] {
+            let measured = ratio(view);
+            assert!(
+                (measured - expected).abs() < 0.05,
+                "{view}: silhouette ratio {measured} != {expected}"
+            );
+        }
+
+        assert!(ratio(View::Front) < ratio(View::Top));
+        assert!(ratio(View::Top) < ratio(View::Left));
+    }
+
     #[test]
     fn each_view_renders_nonempty() {
-        let cube = cube_drawable();
+        let cube = box_drawable(Vec3::new(0.5, 0.5, 0.5));
         let options = options(64, 64);
         let rendered =
             render_views(&cube, &TextureSet::new(), &options, &View::ALL).unwrap();

@@ -75,6 +75,64 @@ mod tests {
         Vec4::new(c.x / c.w, c.y / c.w, c.z / c.w, c.w)
     }
 
+    /// Pins the exact eye direction and distance of every view, so a swapped
+    /// axis or sign cannot hide behind a symmetric model.
+    #[test]
+    fn eye_sits_along_the_documented_direction_at_the_fitted_distance() {
+        let bounds = DrawableBounds {
+            center: Vec3::new(2.0, -3.0, 5.0),
+            sphere_radius: 1.0,
+            box_min: Vec3::new(1.0, -4.0, 4.0),
+            box_max: Vec3::new(3.0, -2.0, 6.0),
+        };
+        let fov_deg = 40.0f32;
+        let margin = 1.1f32;
+
+        // r = max(sphere radius, half box diagonal) with a 2x2x2 box.
+        let radius = (Vec3::new(2.0, 2.0, 2.0).length() * 0.5).max(1.0);
+        let expected_distance = radius / (fov_deg.to_radians() * 0.5).sin() * margin;
+
+        let expected = [
+            (View::Front, Vec3::new(0.0, 1.0, 0.0)),
+            (View::Back, Vec3::new(0.0, -1.0, 0.0)),
+            (View::Left, Vec3::new(-1.0, 0.0, 0.0)),
+            (View::Right, Vec3::new(1.0, 0.0, 0.0)),
+            (View::Top, Vec3::new(0.0, 0.0, 1.0)),
+            (View::Iso, Vec3::new(1.0, -1.0, 1.0).normalize()),
+        ];
+
+        for (view, direction) in expected {
+            let (_, eye, _) = camera_for(&bounds, view, 1.0, fov_deg, margin);
+            let offset = eye - bounds.center;
+            assert!(
+                (offset.length() - expected_distance).abs() < 1e-3,
+                "{view}: distance {} != {expected_distance}",
+                offset.length()
+            );
+            let unit = offset.normalize();
+            assert!(
+                (unit - direction).length() < 1e-5,
+                "{view}: direction {unit:?} != {direction:?}"
+            );
+        }
+    }
+
+    /// The up vector: +Z is screen-up everywhere except Top, which uses +Y.
+    #[test]
+    fn up_axis_points_up_on_screen() {
+        let up_axis = |view| match view {
+            View::Top => Vec3::Y,
+            _ => Vec3::Z,
+        };
+
+        for view in View::ALL {
+            let (view_proj, _, _) = camera_for(&bounds(), view, 1.0, 40.0, 1.1);
+            let p = ndc(&view_proj, up_axis(view) * 0.5);
+            assert!(p.w > 0.0, "{view}: up sample behind the camera");
+            assert!(p.y > 1e-3, "{view}: up axis did not project upward ({p:?})");
+        }
+    }
+
     #[test]
     fn every_view_places_the_eye_outside_the_bounds() {
         for view in View::ALL {
