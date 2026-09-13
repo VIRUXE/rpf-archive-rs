@@ -34,7 +34,7 @@ pub use wasm::convert_to_gltf;
 pub use ymt::{parse_ymt, PedVariationInfo};
 pub use math::{Vec2, Vec3, Vec4, Mat4};
 pub use resource::{SYSTEM_BASE, GRAPHICS_BASE};
-pub use font::{draw_text, text_width};
+pub use font::{draw_text, text_width, FONT_5X7, GLYPH_H, GLYPH_W};
 pub use render::{render_drawable, render_views, RenderOptions, RenderReport, TextureSet, View};
 pub use sheet::{compose_sheet, sheet_layout, SheetItem, SheetOptions};
 pub use image;

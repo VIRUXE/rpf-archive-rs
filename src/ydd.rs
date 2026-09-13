@@ -312,14 +312,7 @@ pub fn parse_ydd(data: &[u8]) -> Result<Vec<DrawableEntry>> {
 pub fn parse_drawables(data: &[u8], kind: DrawableKind) -> Result<Vec<DrawableEntry>> {
     if kind == DrawableKind::Yft {
         let fragment = crate::yft::parse_yft(data)?;
-        let mut entries = Vec::new();
-        if let Some(drawable) = fragment.drawable {
-            let name = if fragment.name.is_empty() { drawable.name.clone() } else { fragment.name.clone() };
-            let hash = drawable.name_hash;
-            entries.push(DrawableEntry { hash, name: entry_name(&name, hash), drawable });
-        }
-        entries.extend(fragment.extra_drawables);
-        return Ok(entries);
+        return Ok(assemble_fragment_entries(fragment));
     }
 
     let (system, graphics) = prepare_rsc7(data)?;
@@ -339,6 +332,35 @@ pub fn parse_drawables(data: &[u8], kind: DrawableKind) -> Result<Vec<DrawableEn
     let drawable = parse_drawable_at(&reader, SYSTEM_BASE, 0xA8, 0xD0, None)?;
     let hash = drawable.name_hash;
     Ok(vec![DrawableEntry { hash, name: entry_name(&drawable.name, hash), drawable }])
+}
+
+/// Assembles a fragment's main drawable and its extras into one flat, named
+/// list. A fragment's extra drawables (damaged variants, attached props) are
+/// pushed by [`crate::yft::parse_yft`] verbatim; when the resource has no
+/// names array (or an empty one), every extra falls back to the same
+/// resource-level name and hash — the same collision `make_names_unique`
+/// already fixes for `.ydd` dictionaries — so it's run here too before the
+/// list is handed back.
+fn assemble_fragment_entries(fragment: crate::yft::Fragment) -> Vec<DrawableEntry> {
+    let mut entries = Vec::new();
+    if let Some(drawable) = fragment.drawable {
+        let name = if fragment.name.is_empty() { drawable.name.clone() } else { fragment.name.clone() };
+        let hash = drawable.name_hash;
+        entries.push(DrawableEntry { hash, name: entry_name(&name, hash), drawable });
+    }
+    for extra in fragment.extra_drawables {
+        let name = entry_name(&extra.name, extra.hash);
+        entries.push(DrawableEntry { hash: extra.hash, name, drawable: extra.drawable });
+    }
+
+    let mut names: Vec<String> = entries.iter().map(|entry| entry.name.clone()).collect();
+    let hashes: Vec<u32> = entries.iter().map(|entry| entry.hash).collect();
+    make_names_unique(&mut names, &hashes);
+    for (entry, name) in entries.iter_mut().zip(names) {
+        entry.name = name;
+    }
+
+    entries
 }
 
 fn entry_name(name: &str, hash: u32) -> String {
@@ -1531,6 +1553,46 @@ pub(crate) mod tests {
 
     fn sections_reader<'a>(system: &'a [u8], graphics: &'a [u8]) -> ResReader<'a> {
         ResReader { system, graphics }
+    }
+
+    fn stub_drawable(name: &str) -> Drawable {
+        Drawable {
+            name: name.to_string(),
+            name_hash: rage_joaat(name),
+            bounds: DrawableBounds {
+                center: Vec3::new(0.0, 0.0, 0.0),
+                sphere_radius: 0.0,
+                box_min: Vec3::new(0.0, 0.0, 0.0),
+                box_max: Vec3::new(0.0, 0.0, 0.0),
+            },
+            lod_distances: [0.0; 4],
+            render_masks: [0; 4],
+            shader_group: None,
+            lods: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn assemble_fragment_entries_gives_unnamed_extras_distinct_names() {
+        // A fragment whose extras have no names array: `parse_yft` falls back
+        // to the resource-level name for every extra, so without
+        // `make_names_unique` both would come back identical and one would
+        // silently overwrite the other when written out as files.
+        let fragment = crate::yft::Fragment {
+            name: "frag".to_string(),
+            bound_center: Vec3::new(0.0, 0.0, 0.0),
+            bound_radius: 0.0,
+            drawable: None,
+            extra_drawables: vec![
+                DrawableEntry { hash: rage_joaat("frag"), name: "frag".to_string(), drawable: stub_drawable("frag") },
+                DrawableEntry { hash: rage_joaat("frag"), name: "frag".to_string(), drawable: stub_drawable("frag") },
+            ],
+        };
+
+        let entries = assemble_fragment_entries(fragment);
+
+        assert_eq!(entries.len(), 2);
+        assert_ne!(entries[0].name, entries[1].name);
     }
 
     #[test]

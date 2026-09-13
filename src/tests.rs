@@ -172,3 +172,16 @@ mod writer_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod lib_reexport_tests {
+    /// `font::{FONT_5X7, GLYPH_W, GLYPH_H}` must be reachable from the crate
+    /// root alongside `draw_text`/`text_width`, so callers laying out their
+    /// own glyphs don't have to reach into the `font` module directly.
+    #[test]
+    fn font_glyph_table_is_reexported_at_crate_root() {
+        assert_eq!(crate::GLYPH_W, 5);
+        assert_eq!(crate::GLYPH_H, 7);
+        assert_eq!(crate::FONT_5X7.len(), 96);
+    }
+}

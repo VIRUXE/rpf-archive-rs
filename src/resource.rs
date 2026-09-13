@@ -28,10 +28,10 @@ impl<'a> ResReader<'a> {
         if va == 0 { return None; }
         if (va & 0x50000000) == 0x50000000 && (va & 0x60000000) != 0x60000000 {
             let off = (va - 0x50000000) as usize;
-            self.system.get(off..off + len)
+            self.system.get(off..off.checked_add(len)?)
         } else if (va & 0x60000000) == 0x60000000 {
             let off = (va - 0x60000000) as usize;
-            self.graphics.get(off..off + len)
+            self.graphics.get(off..off.checked_add(len)?)
         } else {
             None
         }
@@ -50,24 +50,24 @@ impl<'a> ResReader<'a> {
         if count == 0 || va == 0 {
             return Some(Vec::new());
         }
-        let bytes = self.resolve(va, count * 2)?;
-        Some((0..count).map(|i| u16_le(bytes, i * 2)).collect())
+        let bytes = self.resolve(va, count.checked_mul(2)?)?;
+        Some(bytes.chunks_exact(2).map(|c| u16_le(c, 0)).collect())
     }
 
     pub fn read_u32_list(&self, va: u64, count: usize) -> Option<Vec<u32>> {
         if count == 0 || va == 0 {
             return Some(Vec::new());
         }
-        let bytes = self.resolve(va, count * 4)?;
-        Some((0..count).map(|i| u32_le(bytes, i * 4)).collect())
+        let bytes = self.resolve(va, count.checked_mul(4)?)?;
+        Some(bytes.chunks_exact(4).map(|c| u32_le(c, 0)).collect())
     }
 
     pub fn read_u64_list(&self, va: u64, count: usize) -> Option<Vec<u64>> {
         if count == 0 || va == 0 {
             return Some(Vec::new());
         }
-        let bytes = self.resolve(va, count * 8)?;
-        Some((0..count).map(|i| u64_le(bytes, i * 8)).collect())
+        let bytes = self.resolve(va, count.checked_mul(8)?)?;
+        Some(bytes.chunks_exact(8).map(|c| u64_le(c, 0)).collect())
     }
 
     /// Reads a 16-byte pointer-list header: pointer@0, count@8, capacity@10.
@@ -80,11 +80,18 @@ impl<'a> ResReader<'a> {
         })
     }
 
+    /// Longest string this reads before giving up on finding a terminating
+    /// NUL. Real names are short; a runaway scan across the rest of the
+    /// section usually means the pointer is bogus, so it's treated as an
+    /// unresolved string (`None`) rather than returned truncated.
+    const MAX_STRING_LEN: usize = 256;
+
     pub fn string_at(&self, va: u64) -> Option<String> {
         if (va & 0x50000000) == 0x50000000 && (va & 0x60000000) != 0x60000000 {
             let off = (va - 0x50000000) as usize;
             let slice = self.system.get(off..)?;
-            let end = slice.iter().position(|&b| b == 0).unwrap_or(slice.len());
+            let scan_len = slice.len().min(Self::MAX_STRING_LEN);
+            let end = slice[..scan_len].iter().position(|&b| b == 0)?;
             Some(String::from_utf8_lossy(&slice[..end]).into_owned())
         } else {
             None
@@ -220,6 +227,52 @@ mod tests {
 
         // count == 0 -> empty vec, even for a null va.
         assert_eq!(reader.read_u32_list(0, 0), Some(Vec::new()));
+    }
+
+    #[test]
+    fn read_lists_reject_counts_that_would_overflow_the_byte_length() {
+        let sys = build_system_buffer();
+        let reader = ResReader { system: &sys, graphics: &[] };
+        let array_va = SYSTEM_BASE + 0x100;
+
+        // On a 32-bit `usize` (wasm32), `count * N` wraps around instead of
+        // overflowing, so pick a count that overflows even a 64-bit `usize`
+        // multiplication to make the assertion hold on every target.
+        let huge_count = usize::MAX / 4 + 1;
+
+        assert_eq!(reader.read_u16_list(array_va, huge_count), None);
+        assert_eq!(reader.read_u32_list(array_va, huge_count), None);
+        assert_eq!(reader.read_u64_list(array_va, huge_count), None);
+    }
+
+    #[test]
+    fn resolve_rejects_offset_length_overflow_instead_of_panicking() {
+        let reader = ResReader { system: &[], graphics: &[] };
+
+        // A `va` with bit 29 (system) or bit 30 (graphics) set near `u64::MAX`
+        // plus a huge `len` used to overflow `off + len` in debug builds.
+        assert_eq!(reader.resolve(u64::MAX, usize::MAX), None);
+    }
+
+    #[test]
+    fn string_at_gives_up_past_the_scan_cap_instead_of_returning_untruncated() {
+        // No NUL anywhere in a buffer larger than the scan cap -> None, not a
+        // huge (or truncated) string.
+        let sys = vec![b'A'; 512];
+        let reader = ResReader { system: &sys, graphics: &[] };
+        assert_eq!(reader.string_at(SYSTEM_BASE), None);
+
+        // A NUL just past the cap still isn't found.
+        let mut sys = vec![b'A'; 300];
+        sys[300 - 1] = 0; // NUL at index 299, past the 256-byte scan window
+        let reader = ResReader { system: &sys, graphics: &[] };
+        assert_eq!(reader.string_at(SYSTEM_BASE), None);
+
+        // A NUL within the cap still works normally.
+        let mut sys = vec![b'A'; 10];
+        sys[5] = 0;
+        let reader = ResReader { system: &sys, graphics: &[] };
+        assert_eq!(reader.string_at(SYSTEM_BASE), Some("AAAAA".to_string()));
     }
 
     #[test]

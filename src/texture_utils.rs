@@ -31,11 +31,59 @@ pub fn decompress_texture(texture: &YtdTexture) -> Result<Vec<u8>> {
     Ok(rgba)
 }
 
+/// Smallest plausible `pixel_data` length for a texture of this size and
+/// format: block-compressed formats need at least one block's worth of bytes
+/// per 4x4 tile, uncompressed formats need `bytes_per_pixel` bytes per texel.
+/// All the arithmetic saturates instead of overflowing — a saturated minimum
+/// is already far larger than any real `pixel_data`, so the length check
+/// below rejects it just the same.
+fn min_pixel_data_len(format: TextureFormat, width: usize, height: usize) -> usize {
+    match format {
+        TextureFormat::DXT1 | TextureFormat::ATI1 => block_len(width, height, 8),
+        TextureFormat::DXT3 | TextureFormat::DXT5 | TextureFormat::ATI2 | TextureFormat::BC7 => {
+            block_len(width, height, 16)
+        }
+        TextureFormat::A8R8G8B8 | TextureFormat::X8R8G8B8 | TextureFormat::A8B8G8R8 => {
+            width.saturating_mul(height).saturating_mul(4)
+        }
+        TextureFormat::A1R5G5B5 => width.saturating_mul(height).saturating_mul(2),
+        TextureFormat::L8 | TextureFormat::A8 => width.saturating_mul(height),
+        // Unknown/unsupported formats hit the `_ => bail!` arm below
+        // regardless; a 1-byte-per-texel floor still keeps a bogus
+        // width/height pair from reaching the allocation below.
+        _ => width.saturating_mul(height),
+    }
+}
+
+fn block_len(width: usize, height: usize, block_bytes: usize) -> usize {
+    let blocks_x = width.saturating_add(3) / 4;
+    let blocks_y = height.saturating_add(3) / 4;
+    blocks_x.saturating_mul(blocks_y).saturating_mul(block_bytes)
+}
+
 fn decode_top_level(texture: &YtdTexture) -> Result<Vec<u8>> {
     let width = texture.width as usize;
     let height = texture.height as usize;
-    let mut rgba_u32 = vec![0u32; width * height];
-    
+
+    // `width`/`height` come straight from the file; a corrupt or malicious
+    // header can claim dimensions far larger than `pixel_data` actually
+    // holds. Rejecting that up front — before allocating a `width * height`
+    // buffer — turns what would otherwise be a huge allocation (or, once
+    // `width * height` itself overflows `usize`, a panic) into an ordinary
+    // error.
+    let pixel_count = width.checked_mul(height).ok_or_else(|| {
+        anyhow::anyhow!("texture dimensions {}x{} overflow", texture.width, texture.height)
+    })?;
+    let min_len = min_pixel_data_len(texture.format, width, height);
+    if texture.pixel_data.len() < min_len {
+        bail!(
+            "pixel data too short for a {}x{} {:?} texture: got {} bytes, need at least {}",
+            texture.width, texture.height, texture.format, texture.pixel_data.len(), min_len
+        );
+    }
+
+    let mut rgba_u32 = vec![0u32; pixel_count];
+
     match texture.format {
         TextureFormat::DXT1 => {
             texture2ddecoder::decode_bc1(&texture.pixel_data, width, height, &mut rgba_u32)
@@ -348,6 +396,26 @@ mod tests {
         let tex = texture(TextureFormat::A8, vec![0x10; 4]);
         assert!(decompress_texture(&tex).is_err(), "4 bytes cannot fill a 4x4 texture");
         assert!(to_rgba_image(&tex).is_err());
+    }
+
+    /// A header claiming a huge texture backed by almost no data must be
+    /// rejected before the decoder tries to allocate a `width * height`
+    /// buffer for it (which, for 65535x65535, would be tens of gigabytes).
+    #[test]
+    fn oversized_header_with_tiny_pixel_data_errors_without_allocating() {
+        let tex = YtdTexture {
+            name: "test".into(),
+            name_hash: 0,
+            width: 65535,
+            height: 65535,
+            depth: 1,
+            format: TextureFormat::DXT1,
+            levels: 1,
+            stride: 0,
+            pixel_data: vec![0u8; 1],
+        };
+
+        assert!(decompress_texture(&tex).is_err());
     }
 
     fn texture_1x1(format: TextureFormat, pixel_data: Vec<u8>) -> YtdTexture {
