@@ -214,6 +214,54 @@ mod tests {
     }
 
     #[test]
+    fn draw_text_sets_known_pixels_for_more_glyphs() {
+        let white = [255, 255, 255, 255];
+        let empty = image::Rgba([0, 0, 0, 0]);
+
+        // ' ' (space): entirely blank.
+        let mut img = RgbaImage::from_pixel(GLYPH_W, GLYPH_H, image::Rgba([0, 0, 0, 0]));
+        draw_text(&mut img, 0, 0, " ", 1, white);
+        for row in 0..GLYPH_H {
+            for col in 0..GLYPH_W {
+                assert_eq!(*img.get_pixel(col, row), empty);
+            }
+        }
+
+        // '-' (0x2D, columns all 0x08 -> bit 3 only): a single solid middle row.
+        let mut img = RgbaImage::from_pixel(GLYPH_W, GLYPH_H, image::Rgba([0, 0, 0, 0]));
+        draw_text(&mut img, 0, 0, "-", 1, white);
+        for col in 0..GLYPH_W {
+            assert_eq!(*img.get_pixel(col, 3), image::Rgba(white), "middle row set at col {col}");
+            assert_eq!(*img.get_pixel(col, 0), empty, "top row empty at col {col}");
+            assert_eq!(*img.get_pixel(col, 6), empty, "bottom row empty at col {col}");
+        }
+
+        // '_' (0x5F, columns all 0x40 -> bit 6 only): a single solid bottom row.
+        let mut img = RgbaImage::from_pixel(GLYPH_W, GLYPH_H, image::Rgba([0, 0, 0, 0]));
+        draw_text(&mut img, 0, 0, "_", 1, white);
+        for col in 0..GLYPH_W {
+            assert_eq!(*img.get_pixel(col, 6), image::Rgba(white), "bottom row set at col {col}");
+            assert_eq!(*img.get_pixel(col, 0), empty, "top row empty at col {col}");
+        }
+
+        // '0' ([0x3E, 0x51, 0x49, 0x45, 0x3E]): left stroke spans rows 1..=5,
+        // its top-left corner (row 0) is empty.
+        let mut img = RgbaImage::from_pixel(GLYPH_W, GLYPH_H, image::Rgba([0, 0, 0, 0]));
+        draw_text(&mut img, 0, 0, "0", 1, white);
+        assert_eq!(*img.get_pixel(0, 0), empty); // top-left corner empty
+        assert_eq!(*img.get_pixel(0, 3), image::Rgba(white)); // left stroke, middle row
+        assert_eq!(*img.get_pixel(1, 0), image::Rgba(white)); // top edge starts at col 1
+
+        // 'x' ([0x44, 0x28, 0x10, 0x28, 0x44]): the two diagonals cross at
+        // the center pixel; the corners are empty.
+        let mut img = RgbaImage::from_pixel(GLYPH_W, GLYPH_H, image::Rgba([0, 0, 0, 0]));
+        draw_text(&mut img, 0, 0, "x", 1, white);
+        assert_eq!(*img.get_pixel(2, 4), image::Rgba(white)); // crossing point
+        assert_eq!(*img.get_pixel(0, 0), empty); // top-left corner empty
+        assert_eq!(*img.get_pixel(4, 0), empty); // top-right corner empty
+    }
+
+    #[test]
     fn draw_text_clips_at_edges() {
         let mut img = RgbaImage::from_pixel(4, 4, image::Rgba([0, 0, 0, 0]));
         // Should not panic even though most of the glyph falls outside bounds.
