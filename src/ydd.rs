@@ -1451,7 +1451,7 @@ fn bounds_are_degenerate(bounds: &DrawableBounds) -> bool {
 // ─── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::resource::{GRAPHICS_BASE, SYSTEM_BASE};
     use crate::writer::rage_joaat;
@@ -1716,7 +1716,7 @@ mod tests {
 
     /// A hand-built YDR (or YDD, when `as_dictionary`) resource: one drawable
     /// with one shader, one high LOD model and one three-vertex triangle.
-    pub(super) fn minimal_ydr_sections(as_dictionary: bool) -> (Vec<u8>, Vec<u8>) {
+    pub(crate) fn minimal_ydr_sections(as_dictionary: bool) -> (Vec<u8>, Vec<u8>) {
         let mut system = vec![0u8; 0x800];
         let mut graphics = vec![0u8; 0x200];
         let drawable_offset = if as_dictionary { 0x100 } else { 0x000 };
