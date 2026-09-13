@@ -8,6 +8,11 @@ pub mod ydd;
 pub mod texture_utils;
 pub mod wasm;
 pub mod ymt;
+pub mod math;
+pub mod yft;
+pub mod font;
+pub mod sheet;
+pub mod render;
 mod tests;
 
 pub use archive::{RpfArchive, RpfEntry, RpfEntryKind, RpfEncryption, RpfFile, RpfVersion,
@@ -21,3 +26,5 @@ pub use ytd::{parse_ytd, TextureFormat, YtdTexture};
 pub use ydd::{parse_ydd, Drawable};
 pub use wasm::convert_to_gltf;
 pub use ymt::{parse_ymt, PedVariationInfo};
+pub use math::{Vec2, Vec3, Vec4, Mat4};
+pub use resource::{SYSTEM_BASE, GRAPHICS_BASE};

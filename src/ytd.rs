@@ -2,7 +2,7 @@
 ///
 /// Accepts the standalone RSC7 bytes as returned by `RpfArchive::extract_entry`.
 use anyhow::{Result, Context};
-use crate::resource::{ResReader, prepare_rsc7, u16_le, u32_le, u64_le};
+use crate::resource::{ResReader, prepare_rsc7, u16_le, u32_le, u64_le, SYSTEM_BASE};
 
 // ─── Public types ─────────────────────────────────────────────────────────────
 
@@ -70,7 +70,7 @@ impl std::fmt::Display for TextureFormat {
 }
 
 /// One texture entry extracted from a YTD.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct YtdTexture {
     pub name: String,
     pub name_hash: u32,
@@ -169,19 +169,17 @@ fn write_dx10_header(out: &mut Vec<u8>) {
 pub fn parse_ytd(data: &[u8]) -> Result<Vec<YtdTexture>> {
     let (system, graphics) = prepare_rsc7(data)?;
     let reader = ResReader { system: &system, graphics: &graphics };
-    parse_texture_dict(&reader)
+    parse_texture_dict_at(&reader, SYSTEM_BASE)
 }
 
-fn parse_texture_dict(reader: &ResReader<'_>) -> Result<Vec<YtdTexture>> {
-    let sys = reader.system;
-    if sys.len() < 64 {
-        return Err(anyhow::anyhow!("system section too small for TextureDictionary"));
-    }
+pub(crate) fn parse_texture_dict_at(reader: &ResReader<'_>, va: u64) -> Result<Vec<YtdTexture>> {
+    let dict = reader.resolve(va, 0x40)
+        .ok_or_else(|| anyhow::anyhow!("system section too small for TextureDictionary"))?;
 
-    let hash_ptr   = u64_le(sys, 0x20);
-    let hash_count = u16_le(sys, 0x28) as usize;
-    let tex_ptr_array = u64_le(sys, 0x30);
-    let tex_count     = u16_le(sys, 0x38) as usize;
+    let hash_ptr   = u64_le(dict, 0x20);
+    let hash_count = u16_le(dict, 0x28) as usize;
+    let tex_ptr_array = u64_le(dict, 0x30);
+    let tex_count     = u16_le(dict, 0x38) as usize;
 
     let hash_data = if hash_count > 0 {
         reader.resolve(hash_ptr, hash_count * 4)
