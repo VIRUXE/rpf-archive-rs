@@ -28,5 +28,7 @@ pub use wasm::convert_to_gltf;
 pub use ymt::{parse_ymt, PedVariationInfo};
 pub use math::{Vec2, Vec3, Vec4, Mat4};
 pub use resource::{SYSTEM_BASE, GRAPHICS_BASE};
+pub use font::{draw_text, text_width};
+pub use sheet::{compose_sheet, sheet_layout, SheetItem, SheetOptions};
 pub use image;
 pub use texture_utils::{decompress_texture, to_rgba_image, fit_max_size, encode_image, ImageFormat};
