@@ -376,7 +376,56 @@ pub(crate) fn parse_ydd_from_reader(reader: &ResReader<'_>) -> Result<Vec<Drawab
         entries.push(DrawableEntry { hash, name, drawable });
     }
 
+    let mut names: Vec<String> = entries.iter().map(|entry| entry.name.clone()).collect();
+    let entry_hashes: Vec<u32> = entries.iter().map(|entry| entry.hash).collect();
+    make_names_unique(&mut names, &entry_hashes);
+    for (entry, name) in entries.iter_mut().zip(names) {
+        entry.name = name;
+    }
+
     Ok(entries)
+}
+
+/// Drawables stored in a dictionary usually carry the *resource's* own name
+/// string rather than their own, so several entries come back sharing one
+/// name — which makes them indistinguishable to callers that name files after
+/// them. Identity inside a dictionary is the hash, so every name held by more
+/// than one entry is replaced with that entry's `0x…` hash (and, if even the
+/// hashes collide, with the hash plus the entry's index). Names that are
+/// already unique are left alone.
+fn make_names_unique(names: &mut [String], hashes: &[u32]) {
+    use std::collections::{HashMap, HashSet};
+
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    for name in names.iter() {
+        *counts.entry(name.to_lowercase()).or_insert(0) += 1;
+    }
+
+    let duplicated: HashSet<String> =
+        counts.into_iter().filter(|(_, n)| *n > 1).map(|(name, _)| name).collect();
+    if duplicated.is_empty() {
+        return;
+    }
+
+    let mut used: HashSet<String> = names
+        .iter()
+        .map(|name| name.to_lowercase())
+        .filter(|name| !duplicated.contains(name))
+        .collect();
+
+    for (index, name) in names.iter_mut().enumerate() {
+        if !duplicated.contains(&name.to_lowercase()) {
+            continue;
+        }
+
+        let hash = hashes.get(index).copied().unwrap_or(0);
+        let mut candidate = format!("0x{hash:08X}");
+        if !used.insert(candidate.to_lowercase()) {
+            candidate = format!("0x{hash:08X}_{index}");
+            used.insert(candidate.to_lowercase());
+        }
+        *name = candidate;
+    }
 }
 
 /// True when the system section's header reads like a drawable dictionary:
@@ -1556,6 +1605,46 @@ pub(crate) mod tests {
         assert_eq!(entries[0].name, "test_drawable");
         assert_eq!(entries[0].drawable.name, "test_drawable");
         assert_eq!(entries[0].drawable.name_hash, 0x1234_5678);
+    }
+
+    /// Every drawable in a real dictionary (e.g. a ped component .ydd) points
+    /// at the resource's own name string, so all of them used to come back
+    /// named after the file and callers writing "<name>.png" overwrote a
+    /// single image. Shared names must fall back to the entry's hash.
+    #[test]
+    fn dictionary_entries_sharing_a_name_get_unique_hash_names() {
+        let (mut system, graphics) = minimal_ydr_sections(true);
+
+        // Two hashes and two pointers, both pointing at the one drawable, so
+        // both entries parse with the same embedded name.
+        write_u16(&mut system, 0x28, 2);
+        write_u16(&mut system, 0x2A, 2);
+        write_u32(&mut system, 0x44, 0xAABB_CCDD);
+        write_u16(&mut system, 0x38, 2);
+        write_u16(&mut system, 0x3A, 2);
+        write_u64(&mut system, 0x58, SYSTEM_BASE + 0x100);
+
+        let reader = sections_reader(&system, &graphics);
+        let entries = parse_ydd_from_reader(&reader).expect("fixture should parse");
+
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].hash, 0x1234_5678);
+        assert_eq!(entries[1].hash, 0xAABB_CCDD);
+        assert_eq!(entries[0].name, "0x12345678");
+        assert_eq!(entries[1].name, "0xAABBCCDD");
+        // The underlying drawable still reports what the file says.
+        assert_eq!(entries[0].drawable.name, "test_drawable");
+    }
+
+    #[test]
+    fn unique_names_are_left_alone_and_hash_collisions_still_separate() {
+        let mut names = vec!["alpha".to_string(), "beta".to_string()];
+        make_names_unique(&mut names, &[1, 2]);
+        assert_eq!(names, vec!["alpha", "beta"]);
+
+        let mut names = vec!["same".to_string(), "same".to_string(), "other".to_string()];
+        make_names_unique(&mut names, &[7, 7, 9]);
+        assert_eq!(names, vec!["0x00000007", "0x00000007_1", "other"]);
     }
 
     #[test]
