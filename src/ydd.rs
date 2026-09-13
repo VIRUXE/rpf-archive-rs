@@ -1410,15 +1410,17 @@ impl Drawable {
         self.texture_parameter(shader_id, DIFFUSE_SAMPLER)
     }
 
-    /// Bounds rebuilt from the LOD's vertices, falling back to the drawable's
-    /// stored bounds when it has no usable vertices. The flag says which of
-    /// the two was returned.
+    /// The drawable's stored bounds when they actually describe the LOD's
+    /// vertices, and bounds rebuilt from those vertices when they do not. The
+    /// flag says which of the two was returned.
     ///
-    /// The stored bounds are not trusted for framing: on skinned drawables
-    /// (ped components, for one) they are the skeleton's bounds, several times
+    /// Stored bounds cannot simply be trusted: on skinned drawables (ped
+    /// components, for one) they are the *skeleton's* bounds, several times
     /// the size of the part itself and centred elsewhere, so a camera fitted
-    /// to them shrinks the model to a speck or misses it altogether. The
-    /// vertices are what actually gets drawn, so they decide the frame.
+    /// to them shrinks the model to a speck or misses it altogether. Nor can
+    /// they simply be discarded, since replacing them also replaces the stored
+    /// centre and sphere radius, which the camera uses. So they are checked
+    /// against the vertices and kept whole whenever they agree.
     pub fn bounds_or_computed(&self, lod: &DrawableLod) -> (DrawableBounds, bool) {
         let mut min = Vec3::new(f32::INFINITY, f32::INFINITY, f32::INFINITY);
         let mut max = Vec3::new(f32::NEG_INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY);
@@ -1440,7 +1442,7 @@ impl Drawable {
             }
         }
 
-        if !seen || min == max {
+        if !seen || min == max || bounds_describe(&self.bounds, min, max) {
             return (self.bounds.clone(), false);
         }
 
@@ -1487,6 +1489,36 @@ impl Drawable {
             .map(|model| model.geometries.len())
             .sum()
     }
+}
+
+/// True when `bounds` is a usable description of the box between `min` and
+/// `max`: finite, with a positive radius, and with both corners agreeing to
+/// within a thousandth of the box's diagonal.
+///
+/// Honest bounds land far inside that: a prop and a car measured out of the
+/// retail archives disagree with their own vertices by 1.3e-4 and 4.2e-5 of
+/// the diagonal, while the skeleton bounds stored on ped components are out by
+/// 0.65 to 2.7 — three orders of magnitude either side of the line.
+fn bounds_describe(bounds: &DrawableBounds, min: Vec3, max: Vec3) -> bool {
+    let finite = |v: Vec3| v.x.is_finite() && v.y.is_finite() && v.z.is_finite();
+
+    if !finite(bounds.box_min)
+        || !finite(bounds.box_max)
+        || !finite(bounds.center)
+        || !bounds.sphere_radius.is_finite()
+        || bounds.sphere_radius <= 0.0
+    {
+        return false;
+    }
+
+    let tolerance = (max - min).length() * 1e-3;
+    let close = |a: Vec3, b: Vec3| {
+        (a.x - b.x).abs() <= tolerance
+            && (a.y - b.y).abs() <= tolerance
+            && (a.z - b.z).abs() <= tolerance
+    };
+
+    close(bounds.box_min, min) && close(bounds.box_max, max)
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────────────
@@ -1763,6 +1795,48 @@ pub(crate) mod tests {
         assert!((bounds.sphere_radius - expected_radius).abs() < 1e-5);
     }
 
+    /// The fixture's three vertices span (1,2,3)..(7,8,9). Writes a stored
+    /// box/centre/radius into the drawable header, offset from that box by
+    /// `slack` on every corner.
+    fn ydr_with_stored_bounds(slack: f32) -> (Vec<u8>, Vec<u8>) {
+        let (mut system, graphics) = minimal_ydr_sections(false);
+        let (min, max) = (Vec3::new(1.0, 2.0, 3.0), Vec3::new(7.0, 8.0, 9.0));
+        let center = (min + max) * 0.5;
+
+        write_f32(&mut system, 0x20, center.x);
+        write_f32(&mut system, 0x24, center.y);
+        write_f32(&mut system, 0x28, center.z);
+        write_f32(&mut system, 0x2C, (max - min).length() * 0.5);
+        write_f32(&mut system, 0x30, min.x - slack);
+        write_f32(&mut system, 0x34, min.y - slack);
+        write_f32(&mut system, 0x38, min.z - slack);
+        write_f32(&mut system, 0x40, max.x + slack);
+        write_f32(&mut system, 0x44, max.y + slack);
+        write_f32(&mut system, 0x48, max.z + slack);
+
+        (system, graphics)
+    }
+
+    /// Stored bounds that do describe the vertices are handed back whole —
+    /// centre and sphere radius included, since the camera uses both, and
+    /// recomputing them moves the frame even when the box is right.
+    #[test]
+    fn stored_bounds_that_match_the_vertices_are_kept() {
+        // Well inside the tolerance: the diagonal is sqrt(108) ~ 10.4, so a
+        // thousandth of it is ~1e-2.
+        let (system, graphics) = ydr_with_stored_bounds(0.001);
+        let reader = sections_reader(&system, &graphics);
+        let drawable = parse_drawable_at(&reader, SYSTEM_BASE, 0xA8, 0xD0, None).unwrap();
+
+        let lod = drawable.best_lod().unwrap();
+        let (bounds, computed) = drawable.bounds_or_computed(lod);
+        assert!(!computed, "matching stored bounds should be kept");
+        assert_eq!(bounds.box_min, drawable.bounds.box_min);
+        assert_eq!(bounds.box_max, drawable.bounds.box_max);
+        assert_eq!(bounds.center, drawable.bounds.center);
+        assert_eq!(bounds.sphere_radius, drawable.bounds.sphere_radius);
+    }
+
     /// Skinned drawables (ped components) store the *skeleton's* bounds, which
     /// are far larger than the part and centred elsewhere. Framing by them left
     /// the component a speck in the corner, or off-frame entirely, so the
@@ -1789,6 +1863,21 @@ pub(crate) mod tests {
         let lod = drawable.best_lod().unwrap();
         let (bounds, computed) = drawable.bounds_or_computed(lod);
         assert!(computed, "vertex bounds should win over the stored ones");
+        assert_eq!(bounds.box_min, Vec3::new(1.0, 2.0, 3.0));
+        assert_eq!(bounds.box_max, Vec3::new(7.0, 8.0, 9.0));
+    }
+
+    /// The line between the two: a box a whole unit out on every corner is a
+    /// tenth of this mesh's diagonal, far past the thousandth allowed.
+    #[test]
+    fn stored_bounds_just_outside_the_tolerance_are_replaced() {
+        let (system, graphics) = ydr_with_stored_bounds(1.0);
+        let reader = sections_reader(&system, &graphics);
+        let drawable = parse_drawable_at(&reader, SYSTEM_BASE, 0xA8, 0xD0, None).unwrap();
+
+        let lod = drawable.best_lod().unwrap();
+        let (bounds, computed) = drawable.bounds_or_computed(lod);
+        assert!(computed);
         assert_eq!(bounds.box_min, Vec3::new(1.0, 2.0, 3.0));
         assert_eq!(bounds.box_max, Vec3::new(7.0, 8.0, 9.0));
     }

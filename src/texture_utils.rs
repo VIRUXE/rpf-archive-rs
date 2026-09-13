@@ -10,7 +10,28 @@ fn top_level(data: &[u8], width: usize, height: usize, bytes_per_pixel: usize) -
     if data.len() > wanted { &data[..wanted] } else { data }
 }
 
+/// Decodes the top mip level of `texture` to RGBA bytes.
 pub fn decompress_texture(texture: &YtdTexture) -> Result<Vec<u8>> {
+    let rgba = decode_top_level(texture)?;
+
+    // Callers hand these bytes straight to an image buffer, and
+    // `RgbaImage::from_raw` accepts an over-long one, so a wrong length only
+    // shows up much later as an assertion inside an encoder. Catching it here
+    // keeps the complaint attached to the texture it came from, and makes
+    // truncated input an error for every caller rather than just for
+    // `to_rgba_image`.
+    let wanted = texture.width as usize * texture.height as usize * 4;
+    if rgba.len() != wanted {
+        bail!(
+            "decoded {} pixel bytes for a {}x{} {:?} texture, expected {}",
+            rgba.len(), texture.width, texture.height, texture.format, wanted
+        );
+    }
+
+    Ok(rgba)
+}
+
+fn decode_top_level(texture: &YtdTexture) -> Result<Vec<u8>> {
     let width = texture.width as usize;
     let height = texture.height as usize;
     let mut rgba_u32 = vec![0u32; width * height];
@@ -139,16 +160,6 @@ pub fn decompress_texture(texture: &YtdTexture) -> Result<Vec<u8>> {
 pub fn to_rgba_image(tex: &YtdTexture) -> Result<image::RgbaImage> {
     let (width, height) = (tex.width as u32, tex.height as u32);
     let rgba = decompress_texture(tex)?;
-
-    // `from_raw` accepts an over-long buffer, which then trips an assertion
-    // deep inside the encoders, so the size is checked here instead.
-    let wanted = width as usize * height as usize * 4;
-    if rgba.len() != wanted {
-        bail!(
-            "decoded {} pixel bytes for a {}x{} {:?} texture, expected {}",
-            rgba.len(), width, height, tex.format, wanted
-        );
-    }
 
     image::RgbaImage::from_raw(width, height, rgba)
         .ok_or_else(|| anyhow::anyhow!("pixel buffer does not match texture dimensions"))
@@ -321,13 +332,22 @@ mod tests {
     #[test]
     fn uncompressed_argb_is_reordered() {
         // One BGRA-ordered texel on disk: B=0x11, G=0x22, R=0x33, A=0x44.
-        let rgba = decompress_texture(&texture(
+        let rgba = decompress_texture(&texture_1x1(
             TextureFormat::A8R8G8B8,
             vec![0x11, 0x22, 0x33, 0x44],
         ))
         .unwrap();
 
         assert_eq!(rgba, vec![0x33, 0x22, 0x11, 0x44]);
+    }
+
+    /// The length check belongs to `decompress_texture`, so every caller sees
+    /// truncated input as an error and not just `to_rgba_image`.
+    #[test]
+    fn decompress_texture_rejects_a_short_buffer() {
+        let tex = texture(TextureFormat::A8, vec![0x10; 4]);
+        assert!(decompress_texture(&tex).is_err(), "4 bytes cannot fill a 4x4 texture");
+        assert!(to_rgba_image(&tex).is_err());
     }
 
     fn texture_1x1(format: TextureFormat, pixel_data: Vec<u8>) -> YtdTexture {
