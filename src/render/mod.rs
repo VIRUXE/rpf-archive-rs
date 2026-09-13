@@ -1,1 +1,516 @@
-//! Software renderer — placeholder for a future task.
+//! Software renderer — a small CPU rasterizer that turns a parsed
+//! [`Drawable`] into a preview image, with no GPU and no filesystem access so
+//! it also runs under wasm.
+
+mod camera;
+mod mesh;
+mod raster;
+mod textures;
+
+use anyhow::Result;
+use image::RgbaImage;
+
+use crate::ydd::{Drawable, LodLevel};
+use raster::Framebuffer;
+
+pub use textures::TextureSet;
+
+/// One of the fixed camera angles a drawable can be previewed from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum View {
+    Front,
+    Back,
+    Left,
+    Right,
+    Top,
+    Iso,
+}
+
+impl View {
+    pub const ALL: [View; 6] =
+        [View::Front, View::Back, View::Left, View::Right, View::Top, View::Iso];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            View::Front => "front",
+            View::Back => "back",
+            View::Left => "left",
+            View::Right => "right",
+            View::Top => "top",
+            View::Iso => "iso",
+        }
+    }
+}
+
+impl std::str::FromStr for View {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self> {
+        match value.to_ascii_lowercase().as_str() {
+            "front" => Ok(View::Front),
+            "back" => Ok(View::Back),
+            "left" => Ok(View::Left),
+            "right" => Ok(View::Right),
+            "top" => Ok(View::Top),
+            "iso" => Ok(View::Iso),
+            other => anyhow::bail!("unknown view '{other}'"),
+        }
+    }
+}
+
+impl std::fmt::Display for View {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.label())
+    }
+}
+
+/// Everything the renderer needs beyond the model itself.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RenderOptions {
+    pub width: u32,
+    pub height: u32,
+    pub view: View,
+    pub background: [u8; 4],
+    pub lod: LodLevel,
+    pub backface_cull: bool,
+    pub vertex_colors: bool,
+    pub lighting: bool,
+    pub fov_deg: f32,
+    pub margin: f32,
+}
+
+impl Default for RenderOptions {
+    fn default() -> Self {
+        Self {
+            width: 1024,
+            height: 1024,
+            view: View::Iso,
+            background: [230, 230, 230, 255],
+            lod: LodLevel::High,
+            backface_cull: false,
+            vertex_colors: false,
+            lighting: true,
+            fov_deg: 40.0,
+            margin: 1.1,
+        }
+    }
+}
+
+/// What the renderer found while drawing — useful for diagnostics and for
+/// telling the caller which textures it should have supplied.
+#[derive(Debug, Default, Clone)]
+pub struct RenderReport {
+    /// Diffuse texture names the drawable referenced but the texture set did
+    /// not hold, sorted and deduplicated.
+    pub missing_textures: Vec<String>,
+    pub triangles: usize,
+    pub geometries: usize,
+    /// Geometries drawn in flat grey — whether the name was missing or the
+    /// shader had no diffuse parameter at all.
+    pub untextured_geometries: usize,
+    /// True when the drawable's stored bounds were degenerate and had to be
+    /// rebuilt from the vertices.
+    pub bounds_computed: bool,
+    pub lod: Option<LodLevel>,
+}
+
+/// Renders `d` from `o.view`.
+///
+/// A drawable with no geometry is not an error: the result is a
+/// background-only image and a report with zero triangles.
+pub fn render_drawable(
+    d: &Drawable,
+    tex: &TextureSet,
+    o: &RenderOptions,
+) -> Result<(RgbaImage, RenderReport)> {
+    let mut rendered = render_views(d, tex, o, &[o.view])?;
+    let (_, image, report) = rendered.remove(0);
+    Ok((image, report))
+}
+
+/// Renders `d` once per entry in `views`, preparing the mesh a single time.
+pub fn render_views(
+    d: &Drawable,
+    tex: &TextureSet,
+    o: &RenderOptions,
+    views: &[View],
+) -> Result<Vec<(View, RgbaImage, RenderReport)>> {
+    let width = o.width.max(1);
+    let height = o.height.max(1);
+
+    // The requested LOD when it has models, otherwise whatever the drawable
+    // actually carries.
+    let lod = d
+        .lod(o.lod)
+        .filter(|lod| !lod.models.is_empty())
+        .or_else(|| d.best_lod());
+
+    let mut report = RenderReport::default();
+    let mut geometries = Vec::new();
+    let mut bounds = None;
+
+    if let Some(lod) = lod {
+        report.lod = Some(lod.level);
+        let (computed_bounds, was_computed) = d.bounds_or_computed(lod);
+        report.bounds_computed = was_computed;
+        geometries = mesh::prepare(d, lod, tex, &mut report);
+        bounds = Some(computed_bounds);
+    }
+
+    report.missing_textures.sort();
+    report.missing_textures.dedup();
+
+    let aspect = width as f32 / height as f32;
+    let mut out = Vec::with_capacity(views.len());
+
+    for &view in views {
+        let mut framebuffer = Framebuffer::new(width, height, o.background);
+
+        if let Some(bounds) = &bounds {
+            if !geometries.is_empty() {
+                let (view_proj, _eye, light) =
+                    camera::camera_for(bounds, view, aspect, o.fov_deg, o.margin);
+                for geometry in &geometries {
+                    raster::draw_geometry(&mut framebuffer, geometry, &view_proj, light, o);
+                }
+            }
+        }
+
+        out.push((view, framebuffer.color, report.clone()));
+    }
+
+    Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::math::{Vec2, Vec3};
+    use crate::writer::rage_joaat;
+    use crate::ydd::{
+        Drawable, DrawableBounds, DrawableGeometry, DrawableLod, DrawableModel, IndexBuffer,
+        LodLevel, ShaderFx, ShaderGroup, ShaderParameter, ShaderParameterValue, VertexBuffer,
+        VertexBufferLayout, VertexComponent, VertexComponentType, VertexDeclaration,
+        VertexSemantic, DIFFUSE_SAMPLER,
+    };
+    use std::str::FromStr;
+
+    const STRIDE: u16 = 36;
+
+    /// Position/Normal/TexCoord0/Colour0 — the layout the fixtures below write.
+    fn declaration() -> VertexDeclaration {
+        let component = |semantic, ty: VertexComponentType, offset| VertexComponent {
+            semantic,
+            semantic_index: 0,
+            component_type: ty,
+            offset,
+            size: ty.size_in_bytes(),
+            component_count: ty.component_count(),
+        };
+        VertexDeclaration {
+            flags: 0,
+            stride: STRIDE,
+            unknown_6h: 0,
+            count: 4,
+            types: 0,
+            components: vec![
+                component(VertexSemantic::Position, VertexComponentType::Float3, 0),
+                component(VertexSemantic::Normal, VertexComponentType::Float3, 12),
+                component(VertexSemantic::TexCoord0, VertexComponentType::Float2, 24),
+                component(VertexSemantic::Colour0, VertexComponentType::Colour, 32),
+            ],
+        }
+    }
+
+    type FixtureVertex = (Vec3, Vec3, Vec2, [u8; 4]);
+
+    fn vertex_buffer(vertices: &[FixtureVertex], with_declaration: bool) -> VertexBuffer {
+        let mut data = Vec::with_capacity(vertices.len() * STRIDE as usize);
+        for (position, normal, uv, colour) in vertices {
+            for value in [position.x, position.y, position.z, normal.x, normal.y, normal.z] {
+                data.extend_from_slice(&value.to_le_bytes());
+            }
+            data.extend_from_slice(&uv.x.to_le_bytes());
+            data.extend_from_slice(&uv.y.to_le_bytes());
+            data.extend_from_slice(colour);
+        }
+
+        VertexBuffer {
+            vertex_stride: STRIDE,
+            vertex_count: vertices.len() as u32,
+            data_pointer: 0,
+            info_pointer: 0,
+            declaration: with_declaration.then(declaration),
+            data,
+            layout: VertexBufferLayout::Legacy,
+        }
+    }
+
+    fn geometry(vertices: &[FixtureVertex], indices: Vec<u32>, shader_id: u16) -> DrawableGeometry {
+        DrawableGeometry {
+            shader_id,
+            indices_count: indices.len() as u32,
+            triangles_count: (indices.len() / 3) as u32,
+            vertices_count: vertices.len() as u16,
+            vertex_stride: STRIDE,
+            vertex_buffer: Some(vertex_buffer(vertices, true)),
+            index_buffer: Some(IndexBuffer {
+                indices_count: indices.len() as u32,
+                indices_pointer: 0,
+                indices,
+            }),
+        }
+    }
+
+    /// A shader whose diffuse sampler points at `texture_name` (or has no
+    /// diffuse parameter at all when `texture_name` is `None`).
+    fn shader_group(texture_name: Option<&str>) -> ShaderGroup {
+        let parameters = match texture_name {
+            Some(name) => vec![ShaderParameter {
+                name_hash: DIFFUSE_SAMPLER,
+                data_type: 0,
+                data_pointer: 0,
+                value: ShaderParameterValue::Texture {
+                    name: name.to_string(),
+                    name_hash: rage_joaat(&name.to_lowercase()),
+                },
+            }],
+            None => Vec::new(),
+        };
+
+        ShaderGroup {
+            textures: Vec::new(),
+            shaders: vec![ShaderFx {
+                name_hash: rage_joaat("default"),
+                file_name_hash: 0,
+                render_bucket: 0,
+                render_bucket_mask: 0,
+                parameter_count: parameters.len() as u8,
+                texture_parameter_count: parameters.len() as u8,
+                parameters,
+            }],
+        }
+    }
+
+    /// Degenerate bounds, so `bounds_or_computed` rebuilds them from vertices.
+    fn empty_bounds() -> DrawableBounds {
+        DrawableBounds {
+            center: Vec3::ZERO,
+            sphere_radius: 0.0,
+            box_min: Vec3::ZERO,
+            box_max: Vec3::ZERO,
+        }
+    }
+
+    fn drawable(geometries: Vec<DrawableGeometry>, shaders: ShaderGroup) -> Drawable {
+        Drawable {
+            name: "fixture".to_string(),
+            name_hash: rage_joaat("fixture"),
+            bounds: empty_bounds(),
+            lod_distances: [0.0; 4],
+            render_masks: [0; 4],
+            shader_group: Some(shaders),
+            lods: vec![DrawableLod {
+                level: LodLevel::High,
+                models: vec![DrawableModel {
+                    skeleton_binding: 0,
+                    render_mask_flags: 0,
+                    shader_mapping: vec![0],
+                    geometries,
+                }],
+            }],
+        }
+    }
+
+    /// A quad in the XZ plane (facing -Y, toward the Front camera).
+    fn quad_vertices() -> Vec<FixtureVertex> {
+        let n = Vec3::new(0.0, -1.0, 0.0);
+        vec![
+            (Vec3::new(-1.0, 0.0, -1.0), n, Vec2::new(0.0, 1.0), [255, 255, 255, 255]),
+            (Vec3::new(1.0, 0.0, -1.0), n, Vec2::new(1.0, 1.0), [255, 255, 255, 255]),
+            (Vec3::new(1.0, 0.0, 1.0), n, Vec2::new(1.0, 0.0), [255, 255, 255, 255]),
+            (Vec3::new(-1.0, 0.0, 1.0), n, Vec2::new(0.0, 0.0), [255, 255, 255, 255]),
+        ]
+    }
+
+    fn quad_indices() -> Vec<u32> {
+        vec![0, 1, 2, 0, 2, 3]
+    }
+
+    /// A unit cube centred on the origin, with per-face outward normals.
+    fn cube_drawable() -> Drawable {
+        let faces: [(Vec3, Vec3, Vec3); 6] = [
+            // (normal, u axis, v axis)
+            (Vec3::new(0.0, -1.0, 0.0), Vec3::X, Vec3::Z),
+            (Vec3::new(0.0, 1.0, 0.0), -Vec3::X, Vec3::Z),
+            (Vec3::new(-1.0, 0.0, 0.0), -Vec3::Y, Vec3::Z),
+            (Vec3::new(1.0, 0.0, 0.0), Vec3::Y, Vec3::Z),
+            (Vec3::new(0.0, 0.0, -1.0), Vec3::X, Vec3::Y),
+            (Vec3::new(0.0, 0.0, 1.0), Vec3::X, -Vec3::Y),
+        ];
+
+        let mut vertices = Vec::new();
+        let mut indices = Vec::new();
+        for (normal, u_axis, v_axis) in faces {
+            let base = vertices.len() as u32;
+            let centre = normal * 0.5;
+            let corners = [
+                centre - u_axis * 0.5 - v_axis * 0.5,
+                centre + u_axis * 0.5 - v_axis * 0.5,
+                centre + u_axis * 0.5 + v_axis * 0.5,
+                centre - u_axis * 0.5 + v_axis * 0.5,
+            ];
+            let uvs = [
+                Vec2::new(0.0, 1.0),
+                Vec2::new(1.0, 1.0),
+                Vec2::new(1.0, 0.0),
+                Vec2::new(0.0, 0.0),
+            ];
+            for (corner, uv) in corners.iter().zip(uvs) {
+                vertices.push((*corner, normal, uv, [200, 180, 160, 255]));
+            }
+            indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+        }
+
+        let geometries = vec![geometry(&vertices, indices, 0)];
+        drawable(geometries, shader_group(None))
+    }
+
+    fn options(width: u32, height: u32) -> RenderOptions {
+        RenderOptions { width, height, ..RenderOptions::default() }
+    }
+
+    fn background_count(image: &image::RgbaImage, background: [u8; 4]) -> usize {
+        image.pixels().filter(|p| p.0 == background).count()
+    }
+
+    // ─── Tests ──────────────────────────────────────────────────────────────
+
+    #[test]
+    fn view_from_str() {
+        assert_eq!(View::from_str("front").unwrap(), View::Front);
+        assert_eq!(View::from_str("BACK").unwrap(), View::Back);
+        assert_eq!(View::from_str("Left").unwrap(), View::Left);
+        assert_eq!(View::from_str("right").unwrap(), View::Right);
+        assert_eq!(View::from_str("TOP").unwrap(), View::Top);
+        assert_eq!(View::from_str("iso").unwrap(), View::Iso);
+        assert!(View::from_str("sideways").is_err());
+
+        for view in View::ALL {
+            assert_eq!(View::from_str(view.label()).unwrap(), view);
+            assert_eq!(view.to_string(), view.label());
+        }
+    }
+
+    #[test]
+    fn missing_texture_reported_and_grey() {
+        let vertices = quad_vertices();
+        let drawable = drawable(
+            vec![geometry(&vertices, quad_indices(), 0)],
+            shader_group(Some("nope")),
+        );
+
+        let options = RenderOptions { view: View::Front, ..options(64, 64) };
+        let (image, report) = render_drawable(&drawable, &TextureSet::new(), &options).unwrap();
+
+        assert_eq!(report.missing_textures, vec!["nope".to_string()]);
+        assert_eq!(report.triangles, 2);
+        assert_eq!(report.geometries, 1);
+        assert_eq!(report.untextured_geometries, 1);
+        assert!(report.bounds_computed);
+        assert_eq!(report.lod, Some(LodLevel::High));
+
+        let centre = image.get_pixel(32, 32).0;
+        assert_ne!(centre, options.background);
+        assert_eq!(centre[0], centre[1]);
+        assert_eq!(centre[1], centre[2]);
+        assert_eq!(centre[3], 255);
+    }
+
+    #[test]
+    fn each_view_renders_nonempty() {
+        let cube = cube_drawable();
+        let options = options(64, 64);
+        let rendered =
+            render_views(&cube, &TextureSet::new(), &options, &View::ALL).unwrap();
+
+        assert_eq!(rendered.len(), View::ALL.len());
+        for (view, image, report) in rendered {
+            assert_eq!(image.width(), 64);
+            assert_eq!(image.height(), 64);
+            assert_eq!(report.triangles, 12);
+            let covered = 64 * 64 - background_count(&image, options.background);
+            assert!(covered > 100, "{view} rendered only {covered} foreground pixels");
+        }
+    }
+
+    #[test]
+    fn drawable_without_geometry_renders_background_only() {
+        let empty = Drawable {
+            name: "empty".to_string(),
+            name_hash: 0,
+            bounds: empty_bounds(),
+            lod_distances: [0.0; 4],
+            render_masks: [0; 4],
+            shader_group: None,
+            lods: Vec::new(),
+        };
+
+        let options = options(16, 16);
+        let (image, report) = render_drawable(&empty, &TextureSet::new(), &options).unwrap();
+
+        assert_eq!(report.triangles, 0);
+        assert_eq!(report.geometries, 0);
+        assert_eq!(report.lod, None);
+        assert_eq!(background_count(&image, options.background), 16 * 16);
+    }
+
+    #[test]
+    fn texture_set_lookup_is_case_insensitive_and_layered() {
+        use crate::ytd::{TextureFormat, YtdTexture};
+
+        let texture = |name: &str, rgba: [u8; 4]| YtdTexture {
+            name: name.to_string(),
+            name_hash: rage_joaat(&name.to_lowercase()),
+            width: 1,
+            height: 1,
+            depth: 1,
+            format: TextureFormat::A8B8G8R8,
+            levels: 1,
+            stride: 4,
+            pixel_data: rgba.to_vec(),
+        };
+
+        let mut set = TextureSet::new();
+        assert!(set.is_empty());
+        assert!(set.push_layer(&[texture("Skin", [255, 0, 0, 255])]).is_empty());
+        assert!(set.push_layer(&[texture("skin", [0, 0, 255, 255])]).is_empty());
+
+        assert!(!set.is_empty());
+        assert_eq!(set.len(), 2);
+        // Layer 0 wins.
+        assert_eq!(set.get("SKIN").unwrap().get_pixel(0, 0).0, [255, 0, 0, 255]);
+        assert!(set.get("absent").is_none());
+    }
+
+    #[test]
+    fn undecodable_texture_is_reported_by_push_layer() {
+        use crate::ytd::{TextureFormat, YtdTexture};
+
+        let broken = YtdTexture {
+            name: "broken".to_string(),
+            name_hash: rage_joaat("broken"),
+            width: 4,
+            height: 4,
+            depth: 1,
+            format: TextureFormat::Unknown,
+            levels: 1,
+            stride: 16,
+            pixel_data: vec![0; 8],
+        };
+
+        let mut set = TextureSet::new();
+        assert_eq!(set.push_layer(&[broken]), vec!["broken".to_string()]);
+        assert!(set.is_empty());
+    }
+}
