@@ -1,6 +1,15 @@
 use crate::ytd::{TextureFormat, YtdTexture};
 use anyhow::{Result, bail};
 
+/// Uncompressed pixel data carries the whole mip chain back to back, so only
+/// the leading `width * height * bytes_per_pixel` bytes belong to the top
+/// level. Block-compressed formats are handled by the decoder itself, which
+/// reads exactly the blocks it needs.
+fn top_level(data: &[u8], width: usize, height: usize, bytes_per_pixel: usize) -> &[u8] {
+    let wanted = width.saturating_mul(height).saturating_mul(bytes_per_pixel);
+    if data.len() > wanted { &data[..wanted] } else { data }
+}
+
 pub fn decompress_texture(texture: &YtdTexture) -> Result<Vec<u8>> {
     let width = texture.width as usize;
     let height = texture.height as usize;
@@ -37,8 +46,9 @@ pub fn decompress_texture(texture: &YtdTexture) -> Result<Vec<u8>> {
         }
         TextureFormat::A8R8G8B8 => {
             // Convert ARGB to RGBA
-            let mut rgba = Vec::with_capacity(texture.pixel_data.len());
-            for chunk in texture.pixel_data.chunks_exact(4) {
+            let data = top_level(&texture.pixel_data, width, height, 4);
+            let mut rgba = Vec::with_capacity(data.len());
+            for chunk in data.chunks_exact(4) {
                 rgba.push(chunk[2]); // R
                 rgba.push(chunk[1]); // G
                 rgba.push(chunk[0]); // B
@@ -48,8 +58,9 @@ pub fn decompress_texture(texture: &YtdTexture) -> Result<Vec<u8>> {
         }
         TextureFormat::X8R8G8B8 => {
             // BGRX bytes on disk -> RGBA with A=255.
-            let mut rgba = Vec::with_capacity(texture.pixel_data.len());
-            for chunk in texture.pixel_data.chunks_exact(4) {
+            let data = top_level(&texture.pixel_data, width, height, 4);
+            let mut rgba = Vec::with_capacity(data.len());
+            for chunk in data.chunks_exact(4) {
                 rgba.push(chunk[2]); // R
                 rgba.push(chunk[1]); // G
                 rgba.push(chunk[0]); // B
@@ -59,12 +70,13 @@ pub fn decompress_texture(texture: &YtdTexture) -> Result<Vec<u8>> {
         }
         TextureFormat::A8B8G8R8 => {
             // Already RGBA byte order on disk.
-            return Ok(texture.pixel_data.clone());
+            return Ok(top_level(&texture.pixel_data, width, height, 4).to_vec());
         }
         TextureFormat::L8 => {
             // Grey -> R=G=B=L, A=255.
-            let mut rgba = Vec::with_capacity(texture.pixel_data.len() * 4);
-            for &l in &texture.pixel_data {
+            let data = top_level(&texture.pixel_data, width, height, 1);
+            let mut rgba = Vec::with_capacity(data.len() * 4);
+            for &l in data {
                 rgba.push(l);
                 rgba.push(l);
                 rgba.push(l);
@@ -74,8 +86,9 @@ pub fn decompress_texture(texture: &YtdTexture) -> Result<Vec<u8>> {
         }
         TextureFormat::A8 => {
             // R=G=B=255, A=value.
-            let mut rgba = Vec::with_capacity(texture.pixel_data.len() * 4);
-            for &a in &texture.pixel_data {
+            let data = top_level(&texture.pixel_data, width, height, 1);
+            let mut rgba = Vec::with_capacity(data.len() * 4);
+            for &a in data {
                 rgba.push(255);
                 rgba.push(255);
                 rgba.push(255);
@@ -85,8 +98,9 @@ pub fn decompress_texture(texture: &YtdTexture) -> Result<Vec<u8>> {
         }
         TextureFormat::A1R5G5B5 => {
             // 16-bit little-endian, 1 alpha bit, 5-bit channels expanded to 8-bit.
-            let mut rgba = Vec::with_capacity(texture.pixel_data.len() * 2);
-            for chunk in texture.pixel_data.chunks_exact(2) {
+            let data = top_level(&texture.pixel_data, width, height, 2);
+            let mut rgba = Vec::with_capacity(data.len() * 2);
+            for chunk in data.chunks_exact(2) {
                 let v = u16::from_le_bytes([chunk[0], chunk[1]]);
                 let a1 = (v >> 15) & 0x1;
                 let r5 = (v >> 10) & 0x1F;
@@ -123,8 +137,20 @@ pub fn decompress_texture(texture: &YtdTexture) -> Result<Vec<u8>> {
 
 /// Decompresses the top mip level of `tex` and packs it into an `image::RgbaImage`.
 pub fn to_rgba_image(tex: &YtdTexture) -> Result<image::RgbaImage> {
+    let (width, height) = (tex.width as u32, tex.height as u32);
     let rgba = decompress_texture(tex)?;
-    image::RgbaImage::from_raw(tex.width as u32, tex.height as u32, rgba)
+
+    // `from_raw` accepts an over-long buffer, which then trips an assertion
+    // deep inside the encoders, so the size is checked here instead.
+    let wanted = width as usize * height as usize * 4;
+    if rgba.len() != wanted {
+        bail!(
+            "decoded {} pixel bytes for a {}x{} {:?} texture, expected {}",
+            rgba.len(), width, height, tex.format, wanted
+        );
+    }
+
+    image::RgbaImage::from_raw(width, height, rgba)
         .ok_or_else(|| anyhow::anyhow!("pixel buffer does not match texture dimensions"))
 }
 
@@ -259,6 +285,37 @@ mod tests {
             assert_eq!(texel[2], 0, "blue channel");
             assert_eq!(texel[3], 255, "alpha channel");
         }
+    }
+
+    /// Real textures store the whole mip chain in `pixel_data`. Uncompressed
+    /// formats used to expand all of it, producing a buffer several times too
+    /// long, which blew up as an assertion inside the PNG encoder.
+    #[test]
+    fn uncompressed_formats_use_only_the_top_mip_level() {
+        // 4x4 + 2x2 + 1x1 single-byte levels.
+        let mut data: Vec<u8> = vec![0x10; 16];
+        data.extend_from_slice(&[0x20; 4]);
+        data.push(0x30);
+
+        let mut tex = texture(TextureFormat::A8, data.clone());
+        tex.levels = 3;
+        let image = to_rgba_image(&tex).expect("A8 with mips should decode");
+        assert_eq!(image.dimensions(), (4, 4));
+        assert_eq!(image.as_raw().len(), 4 * 4 * 4);
+        assert!(image.pixels().all(|pixel| pixel.0 == [255, 255, 255, 0x10]));
+
+        let mut tex = texture(TextureFormat::L8, data);
+        tex.levels = 3;
+        let image = to_rgba_image(&tex).expect("L8 with mips should decode");
+        assert_eq!(image.as_raw().len(), 4 * 4 * 4);
+        assert!(image.pixels().all(|pixel| pixel.0 == [0x10, 0x10, 0x10, 255]));
+    }
+
+    /// A buffer that cannot fill the top level is an error, not a panic.
+    #[test]
+    fn short_pixel_buffers_are_reported_as_errors() {
+        let tex = texture(TextureFormat::A8, vec![0x10; 4]);
+        assert!(to_rgba_image(&tex).is_err());
     }
 
     #[test]
