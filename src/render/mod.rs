@@ -170,8 +170,38 @@ pub fn render_views(
             if !geometries.is_empty() {
                 let (view_proj, _eye, light) =
                     camera::camera_for(bounds, view, aspect, o.fov_deg, o.margin);
-                for geometry in &geometries {
+
+                // Solid geometry first, in model order, so the depth buffer
+                // is complete before anything is blended over it.
+                for geometry in geometries.iter().filter(|g| !g.blend.is_translucent()) {
                     raster::draw_geometry(&mut framebuffer, geometry, &view_proj, light, o);
+                }
+
+                // Then every translucent triangle, farthest first, so each
+                // one composites over what lies behind it.
+                let mut translucent: Vec<(f32, usize, &[u32])> = Vec::new();
+                for (index, geometry) in geometries.iter().enumerate() {
+                    if !geometry.blend.is_translucent() {
+                        continue;
+                    }
+                    for triangle in geometry.indices.chunks_exact(3) {
+                        if let Some(depth) =
+                            raster::triangle_depth(&geometry.verts, triangle, &view_proj)
+                        {
+                            translucent.push((depth, index, triangle));
+                        }
+                    }
+                }
+                translucent.sort_by(|a, b| b.0.total_cmp(&a.0));
+                for (_, index, triangle) in translucent {
+                    raster::draw_triangle(
+                        &mut framebuffer,
+                        &geometries[index],
+                        triangle,
+                        &view_proj,
+                        light,
+                        o,
+                    );
                 }
             }
         }
@@ -262,9 +292,9 @@ mod tests {
         }
     }
 
-    /// A shader whose diffuse sampler points at `texture_name` (or has no
-    /// diffuse parameter at all when `texture_name` is `None`).
-    fn shader_group(texture_name: Option<&str>) -> ShaderGroup {
+    /// A shader in `render_bucket` whose diffuse sampler points at
+    /// `texture_name` (or has no diffuse parameter at all when `None`).
+    fn shader(texture_name: Option<&str>, render_bucket: u8) -> ShaderFx {
         let parameters = match texture_name {
             Some(name) => vec![ShaderParameter {
                 name_hash: DIFFUSE_SAMPLER,
@@ -278,18 +308,45 @@ mod tests {
             None => Vec::new(),
         };
 
-        ShaderGroup {
-            textures: Vec::new(),
-            shaders: vec![ShaderFx {
-                name_hash: rage_joaat("default"),
-                file_name_hash: 0,
-                render_bucket: 0,
-                render_bucket_mask: 0,
-                parameter_count: parameters.len() as u8,
-                texture_parameter_count: parameters.len() as u8,
-                parameters,
-            }],
+        ShaderFx {
+            name_hash: rage_joaat("default"),
+            file_name_hash: 0,
+            render_bucket,
+            render_bucket_mask: (1 << render_bucket) | 0xFF00,
+            parameter_count: parameters.len() as u8,
+            texture_parameter_count: parameters.len() as u8,
+            parameters,
         }
+    }
+
+    fn shader_group(texture_name: Option<&str>) -> ShaderGroup {
+        ShaderGroup { textures: Vec::new(), shaders: vec![shader(texture_name, 0)] }
+    }
+
+    fn solid_texture(name: &str, rgba: [u8; 4]) -> crate::ytd::YtdTexture {
+        crate::ytd::YtdTexture {
+            name: name.to_string(),
+            name_hash: rage_joaat(&name.to_lowercase()),
+            width: 1,
+            height: 1,
+            depth: 1,
+            format: crate::ytd::TextureFormat::A8B8G8R8,
+            levels: 1,
+            stride: 4,
+            pixel_data: rgba.to_vec(),
+        }
+    }
+
+    /// A quad in the XZ plane at `y`. The Front camera sits on +Y looking
+    /// back at the origin, so larger `y` is nearer to it.
+    fn quad_at_y(y: f32) -> Vec<FixtureVertex> {
+        quad_vertices()
+            .into_iter()
+            .map(|(mut position, normal, uv, colour)| {
+                position.y = y;
+                (position, normal, uv, colour)
+            })
+            .collect()
     }
 
     /// Degenerate bounds, so `bounds_or_computed` rebuilds them from vertices.
@@ -421,6 +478,92 @@ mod tests {
             assert_eq!(View::from_str(view.label()).unwrap(), view);
             assert_eq!(view.to_string(), view.label());
         }
+    }
+
+    /// Render bucket 1 (alpha) blends, bucket 3 (cutout) discards below half
+    /// alpha, and bucket 0 (opaque) ignores alpha entirely — the same texture
+    /// with alpha 64 gives three different results.
+    #[test]
+    fn render_bucket_selects_how_alpha_is_applied() {
+        let vertices = quad_vertices();
+        let mut textures = TextureSet::new();
+        textures.push_layer(&[solid_texture("faint_red", [255, 0, 0, 64])]);
+        let background = [0, 0, 255, 255];
+        let options = RenderOptions { view: View::Front, background, ..options(64, 64) };
+
+        let render = |bucket: u8| {
+            let drawable = drawable(
+                vec![geometry(&vertices, quad_indices(), 0)],
+                ShaderGroup { textures: Vec::new(), shaders: vec![shader(Some("faint_red"), bucket)] },
+            );
+            let no_light = RenderOptions { lighting: false, ..options };
+            render_drawable(&drawable, &textures, &no_light).unwrap().0.get_pixel(32, 32).0
+        };
+
+        assert_eq!(render(0), [255, 0, 0, 255], "opaque ignores alpha");
+        assert_eq!(render(3), background, "cutout discards alpha < 128");
+        let blended = render(1);
+        assert!((blended[0] as i32 - 64).abs() <= 2, "alpha blends red in: {blended:?}");
+        assert!((blended[2] as i32 - 191).abs() <= 2, "alpha keeps most blue: {blended:?}");
+    }
+
+    /// Translucent geometry is drawn after the solid geometry it sits in
+    /// front of, whatever order the model lists them in.
+    #[test]
+    fn translucent_geometry_is_drawn_after_opaque() {
+        let near = quad_at_y(0.5);
+        let far = quad_at_y(-0.5);
+        let mut textures = TextureSet::new();
+        textures.push_layer(&[
+            solid_texture("half_red", [255, 0, 0, 128]),
+            solid_texture("green", [0, 255, 0, 255]),
+        ]);
+
+        // The translucent quad is listed first and is nearer.
+        let drawable = drawable(
+            vec![geometry(&near, quad_indices(), 0), geometry(&far, quad_indices(), 1)],
+            ShaderGroup {
+                textures: Vec::new(),
+                shaders: vec![shader(Some("half_red"), 1), shader(Some("green"), 0)],
+            },
+        );
+        let options = RenderOptions { view: View::Front, lighting: false, ..options(64, 64) };
+        let (image, _) = render_drawable(&drawable, &textures, &options).unwrap();
+
+        let pixel = image.get_pixel(32, 32).0;
+        assert!((pixel[0] as i32 - 128).abs() <= 2, "red over green: {pixel:?}");
+        assert!((pixel[1] as i32 - 127).abs() <= 2, "green shows through: {pixel:?}");
+    }
+
+    /// Two translucent surfaces are composited back to front.
+    #[test]
+    fn translucent_geometry_is_sorted_back_to_front() {
+        let near = quad_at_y(0.5);
+        let far = quad_at_y(-0.5);
+        let mut textures = TextureSet::new();
+        textures.push_layer(&[
+            solid_texture("half_red", [255, 0, 0, 128]),
+            solid_texture("half_green", [0, 255, 0, 128]),
+        ]);
+
+        // Near listed first: drawn in list order it would be hidden by the
+        // far one's blend; drawn back to front it ends up on top.
+        let drawable = drawable(
+            vec![geometry(&near, quad_indices(), 0), geometry(&far, quad_indices(), 1)],
+            ShaderGroup {
+                textures: Vec::new(),
+                shaders: vec![shader(Some("half_red"), 1), shader(Some("half_green"), 1)],
+            },
+        );
+        let background = [0, 0, 0, 255];
+        let options =
+            RenderOptions { view: View::Front, lighting: false, background, ..options(64, 64) };
+        let (image, _) = render_drawable(&drawable, &textures, &options).unwrap();
+
+        // far green over black = (0,128,0); near red over that = (128,64,0).
+        let pixel = image.get_pixel(32, 32).0;
+        assert!((pixel[0] as i32 - 128).abs() <= 2, "near red on top: {pixel:?}");
+        assert!((pixel[1] as i32 - 64).abs() <= 2, "far green underneath: {pixel:?}");
     }
 
     #[test]

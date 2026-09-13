@@ -181,6 +181,13 @@ for (view, image, report) in rendered {
 `render_drawable` is the single-view shorthand when only `options.view`
 matters.
 
+Each geometry is drawn the way its shader's RAGE render bucket says: bucket 0
+is opaque and ignores alpha, bucket 3 (`cutout`, foliage, fences) is
+alpha-tested at half, and buckets 1 and 2 (`*_alpha`, `decal`) are blended
+over what is already drawn, after all solid geometry, back to front, without
+writing depth. Blending over a transparent background keeps the coverage in
+the output alpha.
+
 One line each on two smaller pieces the renderer and CLI build on:
 - **Contact sheet**: `compose_sheet`/`sheet_layout` lay out a grid of
   labelled thumbnails (e.g. one render per view, or a batch of extracted
@@ -188,6 +195,12 @@ One line each on two smaller pieces the renderer and CLI build on:
 - **Bitmap font**: `draw_text`/`text_width` (backed by the `FONT_5X7` glyph
   table) draw simple pixel labels directly onto an `RgbaImage`, with no font
   file or text-shaping dependency.
+
+## Changes in 0.8.1
+
+- The renderer picks alpha handling from the shader's render bucket instead of
+  alpha-testing any texture that has a translucent pixel. Translucent
+  materials (ziplock bags, glass, decals) now blend instead of vanishing.
 
 ## Breaking changes in 0.8.0
 

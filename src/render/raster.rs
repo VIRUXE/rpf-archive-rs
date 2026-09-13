@@ -3,8 +3,9 @@
 use image::{Rgba, RgbaImage};
 
 use crate::math::{Mat4, Vec2, Vec3};
-use crate::render::mesh::PreparedGeometry;
+use crate::render::mesh::{BlendMode, PreparedGeometry};
 use crate::render::RenderOptions;
+use crate::ydd::UnifiedVertex;
 
 /// Colour used where a geometry has no diffuse texture.
 const FLAT_GREY: [u8; 4] = [153, 153, 153, 255];
@@ -41,10 +42,24 @@ struct Projected {
     color: [f32; 3],
 }
 
-/// Rasterizes every triangle of `g` into `fb`.
+/// Rasterizes every triangle of `g` into `fb`, in index order.
 pub(crate) fn draw_geometry(
     fb: &mut Framebuffer,
     g: &PreparedGeometry,
+    view_proj: &Mat4,
+    light: Vec3,
+    o: &RenderOptions,
+) {
+    for triangle in g.indices.chunks_exact(3) {
+        draw_triangle(fb, g, triangle, view_proj, light, o);
+    }
+}
+
+/// Rasterizes one triangle of `g` (three indices into its vertices) into `fb`.
+pub(crate) fn draw_triangle(
+    fb: &mut Framebuffer,
+    g: &PreparedGeometry,
+    triangle: &[u32],
     view_proj: &Mat4,
     light: Vec3,
     o: &RenderOptions,
@@ -53,60 +68,81 @@ pub(crate) fn draw_geometry(
     let height = fb.color.height() as f32;
     let light = light.normalize();
 
-    for triangle in g.indices.chunks_exact(3) {
-        let mut points = [None; 3];
-        for (slot, index) in triangle.iter().enumerate() {
-            let Some(vertex) = g.verts.get(*index as usize) else { break };
-            let clip = view_proj.transform_point(vertex.position);
-            // The near plane sits in front of the whole model, so anything at
-            // or behind the eye is a degenerate case, not something to clip.
-            if clip.w.is_nan() || clip.w <= 1e-4 {
-                points[slot] = None;
-                break;
-            }
-            let inv_w = 1.0 / clip.w;
-            points[slot] = Some(Projected {
-                x: (clip.x * inv_w + 1.0) * 0.5 * width,
-                y: (1.0 - clip.y * inv_w) * 0.5 * height,
-                z: clip.z * inv_w,
-                inv_w,
-                world: vertex.position,
-                uv: vertex.texcoord0,
-                normal: vertex.normal,
-                color: [
-                    vertex.color0[0] as f32 / 255.0,
-                    vertex.color0[1] as f32 / 255.0,
-                    vertex.color0[2] as f32 / 255.0,
-                ],
-            });
+    let mut points = [None; 3];
+    for (slot, index) in triangle.iter().take(3).enumerate() {
+        let Some(vertex) = g.verts.get(*index as usize) else { break };
+        let clip = view_proj.transform_point(vertex.position);
+        // The near plane sits in front of the whole model, so anything at
+        // or behind the eye is a degenerate case, not something to clip.
+        if clip.w.is_nan() || clip.w <= 1e-4 {
+            points[slot] = None;
+            break;
         }
-
-        let [Some(a), Some(b), Some(c)] = points else { continue };
-
-        // Screen space has y growing downward, so a counter-clockwise (front
-        // facing) triangle in NDC has a negative signed area here.
-        let area = (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x);
-        if !area.is_finite() || area.abs() < 1e-12 {
-            continue;
-        }
-        if o.backface_cull && area > 0.0 {
-            continue;
-        }
-
-        // Normalize the winding so the edge functions below are positive
-        // inside the triangle, keeping one fill rule for both orientations.
-        let (v0, v1, v2) = if area < 0.0 { (a, c, b) } else { (a, b, c) };
-
-        // Only |dot(n, light)| is used, so the face normal's sign is irrelevant.
-        // A degenerate triangle in world space (zero-length cross product) has
-        // no usable normal, and is left unshaded rather than shaded as if it
-        // faced edge-on to the light.
-        let cross = (b.world - a.world).cross(c.world - a.world);
-        let face_normal =
-            (cross.length() > 1e-12).then(|| cross.normalize());
-
-        raster_triangle(fb, g, o, [v0, v1, v2], area.abs(), face_normal, light);
+        let inv_w = 1.0 / clip.w;
+        points[slot] = Some(Projected {
+            x: (clip.x * inv_w + 1.0) * 0.5 * width,
+            y: (1.0 - clip.y * inv_w) * 0.5 * height,
+            z: clip.z * inv_w,
+            inv_w,
+            world: vertex.position,
+            uv: vertex.texcoord0,
+            normal: vertex.normal,
+            color: [
+                vertex.color0[0] as f32 / 255.0,
+                vertex.color0[1] as f32 / 255.0,
+                vertex.color0[2] as f32 / 255.0,
+            ],
+        });
     }
+
+    let [Some(a), Some(b), Some(c)] = points else { return };
+
+    // Screen space has y growing downward, so a counter-clockwise (front
+    // facing) triangle in NDC has a negative signed area here.
+    let area = (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x);
+    if !area.is_finite() || area.abs() < 1e-12 {
+        return;
+    }
+    if o.backface_cull && area > 0.0 {
+        return;
+    }
+
+    // Normalize the winding so the edge functions below are positive
+    // inside the triangle, keeping one fill rule for both orientations.
+    let (v0, v1, v2) = if area < 0.0 { (a, c, b) } else { (a, b, c) };
+
+    // Only |dot(n, light)| is used, so the face normal's sign is irrelevant.
+    // A degenerate triangle in world space (zero-length cross product) has
+    // no usable normal, and is left unshaded rather than shaded as if it
+    // faced edge-on to the light.
+    let cross = (b.world - a.world).cross(c.world - a.world);
+    let face_normal = (cross.length() > 1e-12).then(|| cross.normalize());
+
+    raster_triangle(fb, g, o, [v0, v1, v2], area.abs(), face_normal, light);
+}
+
+/// Clip-space depth (z/w) of a triangle's centroid, for back-to-front
+/// sorting: larger is farther from the eye. `None` when an index is out of
+/// range or a vertex sits at or behind the eye.
+pub(crate) fn triangle_depth(
+    verts: &[UnifiedVertex],
+    triangle: &[u32],
+    view_proj: &Mat4,
+) -> Option<f32> {
+    if triangle.len() < 3 {
+        return None;
+    }
+    let mut sum = 0.0;
+    for index in &triangle[..3] {
+        let vertex = verts.get(*index as usize)?;
+        let clip = view_proj.transform_point(vertex.position);
+        if clip.w.is_nan() || clip.w <= 1e-4 {
+            return None;
+        }
+        sum += clip.z / clip.w;
+    }
+    let depth = sum / 3.0;
+    depth.is_finite().then_some(depth)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -191,9 +227,22 @@ fn raster_triangle(
                     FLAT_GREY[3] as f32,
                 ],
             };
-            if g.alpha_cutout && texel[3] < ALPHA_CUTOFF {
-                continue;
-            }
+            let coverage = match g.blend {
+                BlendMode::Opaque => 1.0,
+                BlendMode::Cutout => {
+                    if texel[3] < ALPHA_CUTOFF {
+                        continue;
+                    }
+                    1.0
+                }
+                BlendMode::Blend | BlendMode::Decal => {
+                    let alpha = texel[3] / 255.0;
+                    if alpha <= 0.0 {
+                        continue;
+                    }
+                    alpha
+                }
+            };
 
             if o.lighting {
                 let normal = if g.has_normals {
@@ -226,6 +275,29 @@ fn raster_triangle(
                 for (value, tint) in texel.iter_mut().zip(tint) {
                     *value *= tint;
                 }
+            }
+
+            if g.blend.is_translucent() {
+                // "Over" compositing on straight alpha. Translucent surfaces
+                // leave the depth buffer alone so they never occlude what is
+                // drawn after them; the caller orders them back to front.
+                let dst = fb.color.get_pixel(px as u32, py as u32).0;
+                let dst_alpha = dst[3] as f32 / 255.0;
+                let out_alpha = coverage + dst_alpha * (1.0 - coverage);
+                let mix = |src: f32, dst: u8| {
+                    (src * coverage + dst as f32 * dst_alpha * (1.0 - coverage)) / out_alpha
+                };
+                fb.color.put_pixel(
+                    px as u32,
+                    py as u32,
+                    Rgba([
+                        to_u8(mix(texel[0], dst[0])),
+                        to_u8(mix(texel[1], dst[1])),
+                        to_u8(mix(texel[2], dst[2])),
+                        to_u8(out_alpha * 255.0),
+                    ]),
+                );
+                continue;
             }
 
             fb.depth[offset] = depth;
@@ -328,7 +400,7 @@ mod tests {
     use super::*;
     use crate::math::{Mat4, Vec2, Vec3};
     use crate::render::camera::camera_for;
-    use crate::render::mesh::PreparedGeometry;
+    use crate::render::mesh::{BlendMode, PreparedGeometry};
     use crate::render::{RenderOptions, View};
     use crate::ydd::{DrawableBounds, UnifiedVertex};
     use image::RgbaImage;
@@ -408,7 +480,7 @@ mod tests {
             indices: vec![0, 1, 2],
             texture: None,
             has_normals: false,
-            alpha_cutout: false,
+            blend: BlendMode::Opaque,
         };
 
         let mut fb = Framebuffer::new(options.width, options.height, options.background);
@@ -433,14 +505,14 @@ mod tests {
             indices: indices.clone(),
             texture: Some(&red),
             has_normals: false,
-            alpha_cutout: false,
+            blend: BlendMode::Opaque,
         };
         let far = PreparedGeometry {
             verts: far_verts,
             indices,
             texture: Some(&blue),
             has_normals: false,
-            alpha_cutout: false,
+            blend: BlendMode::Opaque,
         };
 
         let identity = Mat4::identity();
@@ -474,7 +546,7 @@ mod tests {
             indices,
             texture: Some(&texture),
             has_normals: false,
-            alpha_cutout: false,
+            blend: BlendMode::Opaque,
         };
 
         let mut fb = Framebuffer::new(options.width, options.height, options.background);
@@ -503,13 +575,147 @@ mod tests {
             indices,
             texture: Some(&transparent),
             has_normals: false,
-            alpha_cutout: true,
+            blend: BlendMode::Cutout,
         };
 
         let mut fb = Framebuffer::new(options.width, options.height, options.background);
         draw_geometry(&mut fb, &geometry, &Mat4::identity(), Vec3::Z, &options);
 
         assert!(fb.color.pixels().all(|p| p.0 == BACKGROUND));
+    }
+
+    #[test]
+    fn opaque_ignores_texture_alpha() {
+        let options = flat_options();
+        let transparent_red = solid([255, 0, 0, 0]);
+        let (verts, indices) = ndc_quad(0.0);
+        let geometry = PreparedGeometry {
+            verts,
+            indices,
+            texture: Some(&transparent_red),
+            has_normals: false,
+            blend: BlendMode::Opaque,
+        };
+
+        let mut fb = Framebuffer::new(options.width, options.height, options.background);
+        draw_geometry(&mut fb, &geometry, &Mat4::identity(), Vec3::Z, &options);
+
+        assert_eq!(fb.color.get_pixel(32, 32).0, [255, 0, 0, 255]);
+    }
+
+    #[test]
+    fn blend_mixes_texel_with_framebuffer_by_alpha() {
+        let options = flat_options();
+        // Half-transparent pure red over an opaque blue framebuffer.
+        let half_red = solid([255, 0, 0, 128]);
+        let (verts, indices) = ndc_quad(0.0);
+        let geometry = PreparedGeometry {
+            verts,
+            indices,
+            texture: Some(&half_red),
+            has_normals: false,
+            blend: BlendMode::Blend,
+        };
+
+        let mut fb = Framebuffer::new(options.width, options.height, [0, 0, 255, 255]);
+        draw_geometry(&mut fb, &geometry, &Mat4::identity(), Vec3::Z, &options);
+
+        let pixel = fb.color.get_pixel(32, 32).0;
+        assert!((pixel[0] as i32 - 128).abs() <= 2, "red should be ~half: {pixel:?}");
+        assert_eq!(pixel[1], 0);
+        assert!((pixel[2] as i32 - 127).abs() <= 2, "blue should be ~half: {pixel:?}");
+        assert_eq!(pixel[3], 255);
+    }
+
+    #[test]
+    fn blend_over_transparent_background_keeps_coverage_alpha() {
+        let options = flat_options();
+        let half_red = solid([255, 0, 0, 128]);
+        let (verts, indices) = ndc_quad(0.0);
+        let geometry = PreparedGeometry {
+            verts,
+            indices,
+            texture: Some(&half_red),
+            has_normals: false,
+            blend: BlendMode::Blend,
+        };
+
+        let mut fb = Framebuffer::new(options.width, options.height, [0, 0, 0, 0]);
+        draw_geometry(&mut fb, &geometry, &Mat4::identity(), Vec3::Z, &options);
+
+        let pixel = fb.color.get_pixel(32, 32).0;
+        assert_eq!(pixel[0], 255, "colour over nothing is the texel colour: {pixel:?}");
+        assert_eq!(pixel[3], 128, "alpha over nothing is the texel alpha: {pixel:?}");
+    }
+
+    #[test]
+    fn blend_does_not_write_depth() {
+        let options = flat_options();
+        let half_red = solid([255, 0, 0, 128]);
+        let blue = solid([0, 0, 255, 255]);
+
+        let (near_verts, indices) = ndc_quad(-0.5);
+        let (far_verts, _) = ndc_quad(0.5);
+        let near = PreparedGeometry {
+            verts: near_verts,
+            indices: indices.clone(),
+            texture: Some(&half_red),
+            has_normals: false,
+            blend: BlendMode::Blend,
+        };
+        let far = PreparedGeometry {
+            verts: far_verts,
+            indices,
+            texture: Some(&blue),
+            has_normals: false,
+            blend: BlendMode::Opaque,
+        };
+
+        // A translucent surface drawn first must not block an opaque one
+        // drawn behind it afterwards: ordering is the caller's job.
+        let mut fb = Framebuffer::new(options.width, options.height, options.background);
+        draw_geometry(&mut fb, &near, &Mat4::identity(), Vec3::Z, &options);
+        draw_geometry(&mut fb, &far, &Mat4::identity(), Vec3::Z, &options);
+        assert_eq!(fb.color.get_pixel(32, 32).0, [0, 0, 255, 255]);
+    }
+
+    #[test]
+    fn blend_still_depth_tests_against_nearer_opaque() {
+        let options = flat_options();
+        let half_red = solid([255, 0, 0, 128]);
+        let blue = solid([0, 0, 255, 255]);
+
+        let (near_verts, indices) = ndc_quad(-0.5);
+        let (far_verts, _) = ndc_quad(0.5);
+        let near = PreparedGeometry {
+            verts: near_verts,
+            indices: indices.clone(),
+            texture: Some(&blue),
+            has_normals: false,
+            blend: BlendMode::Opaque,
+        };
+        let far = PreparedGeometry {
+            verts: far_verts,
+            indices,
+            texture: Some(&half_red),
+            has_normals: false,
+            blend: BlendMode::Blend,
+        };
+
+        let mut fb = Framebuffer::new(options.width, options.height, options.background);
+        draw_geometry(&mut fb, &near, &Mat4::identity(), Vec3::Z, &options);
+        draw_geometry(&mut fb, &far, &Mat4::identity(), Vec3::Z, &options);
+        assert_eq!(fb.color.get_pixel(32, 32).0, [0, 0, 255, 255]);
+    }
+
+    #[test]
+    fn triangle_depth_orders_far_before_near() {
+        let (near_verts, indices) = ndc_quad(-0.5);
+        let (far_verts, _) = ndc_quad(0.5);
+        let identity = Mat4::identity();
+        let near = triangle_depth(&near_verts, &indices[..3], &identity).unwrap();
+        let far = triangle_depth(&far_verts, &indices[..3], &identity).unwrap();
+        assert!(far > near);
     }
 
     /// The pixel whose centre sits exactly on a shared vertical edge belongs
@@ -531,14 +737,14 @@ mod tests {
             indices: indices.clone(),
             texture: Some(&red),
             has_normals: false,
-            alpha_cutout: false,
+            blend: BlendMode::Opaque,
         };
         let right = PreparedGeometry {
             verts: right_verts,
             indices,
             texture: Some(&blue),
             has_normals: false,
-            alpha_cutout: false,
+            blend: BlendMode::Opaque,
         };
 
         let identity = Mat4::identity();
@@ -567,7 +773,7 @@ mod tests {
             indices,
             texture: None,
             has_normals: false,
-            alpha_cutout: false,
+            blend: BlendMode::Opaque,
         };
 
         let mut fb = Framebuffer::new(options.width, options.height, options.background);
@@ -592,7 +798,7 @@ mod tests {
             indices: vec![0, 1, 2, 0, 2, 3],
             texture: Some(&white),
             has_normals: false,
-            alpha_cutout: false,
+            blend: BlendMode::Opaque,
         };
 
         let mut fb = Framebuffer::new(options.width, options.height, options.background);
@@ -613,7 +819,7 @@ mod tests {
             indices,
             texture: None,
             has_normals: false,
-            alpha_cutout: false,
+            blend: BlendMode::Opaque,
         };
 
         let mut fb = Framebuffer::new(options.width, options.height, options.background);

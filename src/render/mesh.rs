@@ -6,13 +6,44 @@ use image::RgbaImage;
 use crate::render::{RenderReport, TextureSet};
 use crate::ydd::{Drawable, DrawableLod, UnifiedVertex, VertexSemantic};
 
+/// How a geometry's diffuse alpha is applied, taken from the RAGE render
+/// bucket its shader is assigned to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BlendMode {
+    /// Bucket 0: alpha is ignored.
+    Opaque,
+    /// Bucket 3: alpha-tested, below half is discarded.
+    Cutout,
+    /// Bucket 1: alpha-blended over what is already drawn.
+    Blend,
+    /// Bucket 2: blended like `Blend`; decals sit on other surfaces.
+    Decal,
+}
+
+impl BlendMode {
+    pub(crate) fn from_render_bucket(bucket: u8) -> Self {
+        match bucket {
+            1 => BlendMode::Blend,
+            2 => BlendMode::Decal,
+            3 => BlendMode::Cutout,
+            _ => BlendMode::Opaque,
+        }
+    }
+
+    /// True for the modes that mix with the framebuffer instead of
+    /// replacing it, and so have to be drawn after everything solid.
+    pub(crate) fn is_translucent(self) -> bool {
+        matches!(self, BlendMode::Blend | BlendMode::Decal)
+    }
+}
+
 /// One geometry, ready to rasterize.
 pub(crate) struct PreparedGeometry<'a> {
     pub verts: Vec<UnifiedVertex>,
     pub indices: Vec<u32>,
     pub texture: Option<&'a RgbaImage>,
     pub has_normals: bool,
-    pub alpha_cutout: bool,
+    pub blend: BlendMode,
 }
 
 /// Decodes every geometry of `lod`, resolving diffuse textures against `tex`
@@ -27,9 +58,6 @@ pub(crate) fn prepare<'a>(
     report: &mut RenderReport,
 ) -> Vec<PreparedGeometry<'a>> {
     let mut prepared = Vec::new();
-    // Scanning a texture for translucent pixels is expensive; each distinct
-    // image is only scanned once per prepare pass.
-    let mut cutout_cache: Vec<(*const RgbaImage, bool)> = Vec::new();
 
     for model in &lod.models {
         for geometry in &model.geometries {
@@ -68,20 +96,10 @@ pub(crate) fn prepare<'a>(
                 report.untextured_geometries += 1;
             }
 
-            let alpha_cutout = match texture {
-                Some(image) => {
-                    let key = image as *const RgbaImage;
-                    match cutout_cache.iter().find(|(cached, _)| *cached == key) {
-                        Some((_, cutout)) => *cutout,
-                        None => {
-                            let cutout = image.pixels().any(|pixel| pixel.0[3] < 255);
-                            cutout_cache.push((key, cutout));
-                            cutout
-                        }
-                    }
-                }
-                None => false,
-            };
+            let blend = d
+                .shader(geometry.shader_id)
+                .map(|shader| BlendMode::from_render_bucket(shader.render_bucket))
+                .unwrap_or(BlendMode::Opaque);
 
             let declares_normals = buffer
                 .declaration
@@ -98,7 +116,7 @@ pub(crate) fn prepare<'a>(
             report.triangles += indices.len() / 3;
             report.geometries += 1;
 
-            prepared.push(PreparedGeometry { verts, indices, texture, has_normals, alpha_cutout });
+            prepared.push(PreparedGeometry { verts, indices, texture, has_normals, blend });
         }
     }
 
