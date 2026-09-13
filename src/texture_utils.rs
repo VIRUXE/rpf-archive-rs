@@ -329,6 +329,24 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(rgba, vec![0, 0, 0, 0]);
+
+        // Red-only (r5=0x1F, g5=0, b5=0, alpha bit set): value = 0b1_11111_00000_00000 = 0xFC00.
+        // Little-endian bytes: 0x00, 0xFC.
+        let rgba = decompress_texture(&texture_1x1(
+            TextureFormat::A1R5G5B5,
+            vec![0x00, 0xFC],
+        ))
+        .unwrap();
+        assert_eq!(rgba, vec![255, 0, 0, 255], "red-only A1R5G5B5 must not leak into blue");
+
+        // Blue-only (r5=0, g5=0, b5=0x1F, alpha bit set): value = 0b1_00000_00000_11111 = 0x801F.
+        // Little-endian bytes: 0x1F, 0x80.
+        let rgba = decompress_texture(&texture_1x1(
+            TextureFormat::A1R5G5B5,
+            vec![0x1F, 0x80],
+        ))
+        .unwrap();
+        assert_eq!(rgba, vec![0, 0, 255, 255], "blue-only A1R5G5B5 must not leak into red");
     }
 
     #[test]
