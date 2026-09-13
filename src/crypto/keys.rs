@@ -97,12 +97,22 @@ fn read_ng_tables(data: &[u8]) -> Result<Box<[[[u32; 256]; 16]; 17]>> {
     if data.len() < EXPECTED {
         bail!("NG table data too small: {} bytes (expected {})", data.len(), EXPECTED);
     }
-    let mut tables = vec![[[0u32; 256]; 16]; 17];
+    // The table is 272 KiB. Building it as a value and boxing it afterwards
+    // left several copies of it on the stack, which a debug build could not
+    // fit in the main thread's 1 MiB — every command that needed keys died
+    // with "thread 'main' has overflowed its stack". Converting the boxed
+    // slice first is a pointer cast, so the array is only ever filled in
+    // place, on the heap.
+    let mut tables: Box<[[[u32; 256]; 16]; 17]> = vec![[[0u32; 256]; 16]; 17]
+        .into_boxed_slice()
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("Failed to convert ng tables to fixed array"))?;
+
     let mut offset = 0;
-    for i in 0..17 {
-        for j in 0..16 {
-            for k in 0..256 {
-                tables[i][j][k] = u32::from_le_bytes([
+    for table in tables.iter_mut() {
+        for row in table.iter_mut() {
+            for value in row.iter_mut() {
+                *value = u32::from_le_bytes([
                     data[offset],
                     data[offset + 1],
                     data[offset + 2],
@@ -112,10 +122,8 @@ fn read_ng_tables(data: &[u8]) -> Result<Box<[[[u32; 256]; 16]; 17]>> {
             }
         }
     }
-    let arr: [[[u32; 256]; 16]; 17] = tables
-        .try_into()
-        .map_err(|_| anyhow::anyhow!("Failed to convert ng tables to fixed array"))?;
-    Ok(Box::new(arr))
+
+    Ok(tables)
 }
 
 fn write_ng_tables(tables: &[[[u32; 256]; 16]; 17]) -> Vec<u8> {
@@ -267,3 +275,34 @@ static PC_AES_KEY_HASH: [u8; 20] = [
     0xA0, 0x79, 0x61, 0x28, 0xA7, 0x75, 0x72, 0x0A, 0xC2, 0x04,
     0xD9, 0x81, 0x9F, 0x68, 0xC1, 0x72, 0xE3, 0x95, 0x2C, 0x6D,
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The NG decrypt tables are 272 KiB. They used to be built as a value and
+    /// boxed afterwards, leaving several copies of them on the stack, so a
+    /// debug build of any command that needed keys died with "thread 'main'
+    /// has overflowed its stack" — the main thread only gets 1 MiB. Reading
+    /// them must therefore fit in a stack far smaller than the array itself.
+    #[test]
+    fn reading_the_ng_tables_does_not_need_a_big_stack() {
+        let data = vec![0x7Au8; NG_TABLE_BYTES];
+
+        let worker = std::thread::Builder::new()
+            .stack_size(128 * 1024)
+            .spawn(move || {
+                let tables = read_ng_tables(&data).expect("tables should read");
+                (tables[0][0][0], tables[16][15][255])
+            })
+            .expect("failed to spawn the worker");
+
+        assert_eq!(worker.join().expect("the worker overflowed its stack"),
+                   (0x7A7A_7A7A, 0x7A7A_7A7A));
+    }
+
+    #[test]
+    fn short_ng_table_data_is_rejected() {
+        assert!(read_ng_tables(&vec![0u8; NG_TABLE_BYTES - 1]).is_err());
+    }
+}
