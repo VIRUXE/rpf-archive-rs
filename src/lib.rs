@@ -28,7 +28,7 @@ pub use ydd::{parse_ydd, parse_ydr, parse_drawables, Drawable, DrawableBounds, D
               ShaderFx, ShaderGroup, ShaderParameter, ShaderParameterValue, UnifiedVertex,
               VertexAttribute, VertexAttributeValue, VertexBuffer, VertexBufferLayout,
               VertexComponent, VertexComponentType, VertexDeclaration, VertexSemantic,
-              BUMP_SAMPLER, DIFFUSE_SAMPLER, SPEC_SAMPLER};
+              BUMP_SAMPLER, DIFFUSE_SAMPLER, SPEC_SAMPLER, TEXTURE_SAMPLER};
 pub use yft::{parse_yft, wheel_slot, Fragment, FragmentChild, FragmentPart, WheelSlot};
 pub use wasm::convert_to_gltf;
 pub use ymt::{parse_ymt, PedVariationInfo};

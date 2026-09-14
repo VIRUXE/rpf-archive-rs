@@ -19,6 +19,10 @@ pub const DIFFUSE_SAMPLER: u32 = 0xF1FE_2B71;
 pub const BUMP_SAMPLER: u32 = 0x46B7_C64F;
 /// `rage_joaat("specsampler")` — the specular map parameter.
 pub const SPEC_SAMPLER: u32 = 0x6087_99C6;
+/// `rage_joaat("texturesampler")` — the albedo parameter on shaders carried
+/// over from the GTA IV / Max Payne 3 pipelines, used when a shader has no
+/// `DiffuseSampler`.
+pub const TEXTURE_SAMPLER: u32 = 0x2B51_70FD;
 
 // ─── Public types ─────────────────────────────────────────────────────────────
 
@@ -1442,8 +1446,11 @@ impl Drawable {
         })
     }
 
+    /// The albedo texture of a shader: its `DiffuseSampler`, or failing that
+    /// the older `TextureSampler` name.
     pub fn diffuse_texture_name(&self, shader_id: u16) -> Option<&str> {
         self.texture_parameter(shader_id, DIFFUSE_SAMPLER)
+            .or_else(|| self.texture_parameter(shader_id, TEXTURE_SAMPLER))
     }
 
     /// The drawable's stored bounds when they actually describe the LOD's
@@ -1982,6 +1989,26 @@ pub(crate) mod tests {
         assert_eq!(rage_joaat("diffusesampler"), DIFFUSE_SAMPLER);
         assert_eq!(rage_joaat("bumpsampler"), BUMP_SAMPLER);
         assert_eq!(rage_joaat("specsampler"), SPEC_SAMPLER);
+        assert_eq!(rage_joaat("texturesampler"), TEXTURE_SAMPLER);
+    }
+
+    /// Drawables converted from the GTA IV / Max Payne pipelines bind their
+    /// albedo as `TextureSampler` instead of `DiffuseSampler`; the lookup
+    /// falls back to it so those do not render untextured.
+    #[test]
+    fn texture_sampler_is_a_fallback_for_the_diffuse_lookup() {
+        let (mut system, graphics) = minimal_ydr_sections(false);
+        write_u8(&mut system, 0x700, 0);
+        write_u64(&mut system, 0x700 + 0x08, SYSTEM_BASE + 0x7B0);
+        write_u64(&mut system, 0x7B0 + 0x28, SYSTEM_BASE + 0x7A0);
+        system[0x7A0..0x7A4].copy_from_slice(b"foo\0");
+        write_u32(&mut system, 0x710, TEXTURE_SAMPLER);
+
+        let reader = sections_reader(&system, &graphics);
+        let drawable = parse_drawable_at(&reader, SYSTEM_BASE, 0xA8, 0xD0, None).unwrap();
+
+        assert_eq!(drawable.diffuse_texture_name(0), Some("foo"));
+        assert_eq!(drawable.texture_parameter(0, DIFFUSE_SAMPLER), None);
     }
 
     #[test]
