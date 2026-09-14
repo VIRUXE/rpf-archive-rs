@@ -56,6 +56,8 @@ pub struct FragmentPart<'a> {
     /// Per-bone pose applied before `transform`, indexed by each model's
     /// bone index; empty means every model stays where its vertices are.
     pub bone_transforms: &'a [Mat4],
+    /// The physics child's bone tag; `None` for the main drawable.
+    pub bone_tag: Option<u16>,
 }
 
 /// Which wheel a physics child's bone tag names.
@@ -106,6 +108,7 @@ impl Fragment {
                 drawable,
                 transform: Mat4::identity(),
                 bone_transforms: &self.bone_transforms,
+                bone_tag: None,
             });
         }
 
@@ -142,7 +145,12 @@ impl Fragment {
                 _ => child.transform,
             };
 
-            parts.push(FragmentPart { drawable, transform, bone_transforms: &[] });
+            parts.push(FragmentPart {
+                drawable,
+                transform,
+                bone_transforms: &[],
+                bone_tag: Some(child.bone_tag),
+            });
         }
 
         parts
@@ -556,6 +564,8 @@ mod tests {
 
         assert!(parts[0].transform.is_identity());
         assert_eq!(parts[0].bone_transforms.len(), 1, "the body is posed by the bone transforms");
+        let tags: Vec<Option<u16>> = parts.iter().map(|part| part.bone_tag).collect();
+        assert_eq!(tags, [None, Some(27922), Some(26418), Some(27902), Some(26398)]);
         assert!(parts[1..].iter().all(|part| part.bone_transforms.is_empty()));
 
         // Left wheels keep their transform; right wheels are mirrored in X and Z.

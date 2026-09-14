@@ -183,6 +183,24 @@ for (view, image, report) in rendered {
 `render_drawable` is the single-view shorthand when only `options.view`
 matters.
 
+A fragment is more than its main drawable: wheels, doors and other physics
+children are drawables of their own, each placed on the body by a transform.
+`Fragment::render_parts` lists them (filling empty wheel slots from the
+front/rear wheel mesh and mirroring right-hand wheels, as CodeWalker does)
+and `render_parts` frames them together:
+
+```rust
+use rpf_archive::{parse_yft, render_parts, RenderOptions, RenderPart, TextureSet, View};
+
+let fragment = parse_yft(&yft_bytes)?;
+let parts: Vec<RenderPart<'_>> = fragment.render_parts().into_iter().map(RenderPart::from).collect();
+let rendered = render_parts(&parts, &textures, &RenderOptions::default(), &[View::Iso])?;
+```
+
+A `RenderPart` carries the drawable, a transform applied to all of its models
+and an optional per-bone pose selected by each model's bone index, so any
+composite of drawables can be rendered the same way.
+
 Each geometry is drawn the way its shader's RAGE render bucket says: bucket 0
 is opaque and ignores alpha, bucket 3 (`cutout`, foliage, fences) is
 alpha-tested at half, and buckets 1 and 2 (`*_alpha`, `decal`) are blended
@@ -197,6 +215,19 @@ One line each on two smaller pieces the renderer and CLI build on:
 - **Bitmap font**: `draw_text`/`text_width` (backed by the `FONT_5X7` glyph
   table) draw simple pixel labels directly onto an `RgbaImage`, with no font
   file or text-shaping dependency.
+
+## Changes in 0.9.0
+
+- `Fragment` now carries its physics children (`children`) and default bone
+  pose (`bone_transforms`); `Fragment::render_parts` lists the body and every
+  child with a mesh, wheel slots filled in and mirrored as needed.
+- New `render_parts` / `RenderPart` render several placed drawables into one
+  image; `render_views` is the single-part case. Models are posed by their
+  bone index (`DrawableModel::bone_index`, `is_skinned`).
+- `Mat4` gained `from_d3d`, `from_translation`, `translation`,
+  `with_translation`, `is_identity` and `transform_vector`.
+- Breaking: `Fragment` has two new public fields, so code constructing it by
+  hand must set them.
 
 ## Changes in 0.8.1
 
