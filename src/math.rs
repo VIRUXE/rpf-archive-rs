@@ -155,6 +155,42 @@ impl Mat4 {
         Mat4(m)
     }
 
+    /// A matrix as RAGE stores it: D3D row-major, applied as `p * M`, with
+    /// the translation in the fourth row. That memory order is exactly this
+    /// type's column-major order, so the floats are taken verbatim.
+    pub fn from_d3d(rows: [f32; 16]) -> Mat4 {
+        Mat4(rows)
+    }
+
+    pub fn from_translation(t: Vec3) -> Mat4 {
+        Mat4::identity().with_translation(t)
+    }
+
+    pub fn translation(&self) -> Vec3 {
+        Vec3::new(self.0[12], self.0[13], self.0[14])
+    }
+
+    /// The same rotation/scale with a different translation.
+    pub fn with_translation(mut self, t: Vec3) -> Mat4 {
+        self.0[12] = t.x;
+        self.0[13] = t.y;
+        self.0[14] = t.z;
+        self
+    }
+
+    pub fn is_identity(&self) -> bool {
+        *self == Mat4::identity()
+    }
+
+    /// Transforms a direction (implicit w = 0): rotation and scale only.
+    pub fn transform_vector(&self, v: Vec3) -> Vec3 {
+        Vec3::new(
+            self.get(0, 0) * v.x + self.get(1, 0) * v.y + self.get(2, 0) * v.z,
+            self.get(0, 1) * v.x + self.get(1, 1) * v.y + self.get(2, 1) * v.z,
+            self.get(0, 2) * v.x + self.get(1, 2) * v.y + self.get(2, 2) * v.z,
+        )
+    }
+
     #[inline]
     fn get(&self, col: usize, row: usize) -> f32 {
         self.0[col * 4 + row]
@@ -275,6 +311,43 @@ mod tests {
         let p_far = proj.transform_point(Vec3::new(0.0, 0.0, -far));
         let ndc_far_z = p_far.z / p_far.w;
         assert!((ndc_far_z - 1.0).abs() < 1e-4, "far ndc z = {ndc_far_z}");
+    }
+
+    /// RAGE stores transforms as D3D row-major matrices applied as `p * M`,
+    /// with the translation in the fourth row. Read verbatim they must move
+    /// a point by that translation and rotate it by the upper 3x3.
+    #[test]
+    fn d3d_matrix_applies_rotation_then_row_four_translation() {
+        // 90° about Z (x -> y), translated by (10, 20, 30).
+        let m = Mat4::from_d3d([
+            0.0, 1.0, 0.0, 0.0,
+            -1.0, 0.0, 0.0, 0.0,
+            0.0, 0.0, 1.0, 0.0,
+            10.0, 20.0, 30.0, 1.0,
+        ]);
+        let p = m.transform_point(Vec3::new(1.0, 0.0, 0.0));
+        assert!((p.x - 10.0).abs() < 1e-6 && (p.y - 21.0).abs() < 1e-6 && (p.z - 30.0).abs() < 1e-6, "{p:?}");
+        assert_eq!(m.translation(), Vec3::new(10.0, 20.0, 30.0));
+    }
+
+    #[test]
+    fn transform_vector_ignores_translation() {
+        let m = Mat4::from_translation(Vec3::new(5.0, 6.0, 7.0));
+        assert_eq!(m.transform_vector(Vec3::X), Vec3::X);
+        assert_eq!(m.transform_point(Vec3::ZERO).xyz(), Vec3::new(5.0, 6.0, 7.0));
+    }
+
+    #[test]
+    fn identity_is_detected() {
+        assert!(Mat4::identity().is_identity());
+        assert!(!Mat4::from_translation(Vec3::X).is_identity());
+    }
+
+    #[test]
+    fn with_translation_replaces_only_the_last_column() {
+        let m = Mat4::from_translation(Vec3::X).with_translation(Vec3::new(1.0, 2.0, 3.0));
+        assert_eq!(m.translation(), Vec3::new(1.0, 2.0, 3.0));
+        assert_eq!(m.transform_vector(Vec3::Y), Vec3::Y);
     }
 
     #[test]
