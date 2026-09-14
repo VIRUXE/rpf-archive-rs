@@ -44,6 +44,8 @@ pub(crate) struct PreparedGeometry<'a> {
     pub texture: Option<&'a RgbaImage>,
     pub has_normals: bool,
     pub blend: BlendMode,
+    /// Per-channel multiplier (0..=1) applied to the sampled diffuse.
+    pub tint: Option<[f32; 3]>,
 }
 
 /// Decodes every geometry of `lod`, resolving diffuse textures against `tex`
@@ -55,8 +57,10 @@ pub(crate) fn prepare<'a>(
     d: &Drawable,
     lod: &DrawableLod,
     tex: &'a TextureSet,
+    paint: Option<[u8; 3]>,
     report: &mut RenderReport,
 ) -> Vec<PreparedGeometry<'a>> {
+    let paint_tint = paint.map(|rgb| rgb.map(|channel| channel as f32 / 255.0));
     let mut prepared = Vec::new();
 
     for model in &lod.models {
@@ -96,10 +100,14 @@ pub(crate) fn prepare<'a>(
                 report.untextured_geometries += 1;
             }
 
-            let blend = d
-                .shader(geometry.shader_id)
+            let shader = d.shader(geometry.shader_id);
+            let blend = shader
                 .map(|shader| BlendMode::from_render_bucket(shader.render_bucket))
                 .unwrap_or(BlendMode::Opaque);
+            let tint = match shader {
+                Some(shader) if super::is_vehicle_paint_shader(shader.file_name_hash) => paint_tint,
+                _ => None,
+            };
 
             let declares_normals = buffer
                 .declaration
@@ -116,7 +124,7 @@ pub(crate) fn prepare<'a>(
             report.triangles += indices.len() / 3;
             report.geometries += 1;
 
-            prepared.push(PreparedGeometry { verts, indices, texture, has_normals, blend });
+            prepared.push(PreparedGeometry { verts, indices, texture, has_normals, blend, tint });
         }
     }
 

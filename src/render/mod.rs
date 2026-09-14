@@ -77,6 +77,23 @@ pub struct RenderOptions {
     pub lighting: bool,
     pub fov_deg: f32,
     pub margin: f32,
+    /// Body colour for vehicles: multiplied into the diffuse of every
+    /// geometry drawn with a `vehicle_paint*.sps` shader. The game applies
+    /// paint at runtime from carcols metadata, so the YFT itself has none.
+    pub paint: Option<[u8; 3]>,
+}
+
+/// JOAAT hashes of the `vehicle_paint*.sps` shader files (CodeWalker's
+/// `ShaderManager` vehicle batch): paint1, paint2, paint3, paint3_enveff,
+/// paint4, paint4_enveff, paint5_enveff, paint6_enveff, paint8, paint9.
+pub const VEHICLE_PAINT_SPS: [u32; 10] = [
+    3274951810, 1009159769, 2045642561, 1534086746, 4262329590,
+    60950417, 249472155, 354168229, 430888562, 4118002252,
+];
+
+/// Whether a shader's `file_name_hash` names one of the vehicle paint shaders.
+pub fn is_vehicle_paint_shader(file_name_hash: u32) -> bool {
+    VEHICLE_PAINT_SPS.contains(&file_name_hash)
 }
 
 impl Default for RenderOptions {
@@ -92,6 +109,7 @@ impl Default for RenderOptions {
             lighting: true,
             fov_deg: 40.0,
             margin: 1.1,
+            paint: None,
         }
     }
 }
@@ -153,7 +171,7 @@ pub fn render_views(
         report.lod = Some(lod.level);
         let (computed_bounds, was_computed) = d.bounds_or_computed(lod);
         report.bounds_computed = was_computed;
-        geometries = mesh::prepare(d, lod, tex, &mut report);
+        geometries = mesh::prepare(d, lod, tex, o.paint, &mut report);
         bounds = Some(computed_bounds);
     }
 
@@ -478,6 +496,37 @@ mod tests {
             assert_eq!(View::from_str(view.label()).unwrap(), view);
             assert_eq!(view.to_string(), view.label());
         }
+    }
+
+    /// `paint` multiplies the diffuse of geometries drawn with a
+    /// `vehicle_paint*.sps` shader and leaves every other shader alone.
+    #[test]
+    fn paint_tints_only_vehicle_paint_shaders() {
+        let vertices = quad_vertices();
+        let mut textures = TextureSet::new();
+        textures.push_layer(&[solid_texture("white", [255, 255, 255, 255])]);
+        let options = RenderOptions {
+            view: View::Front,
+            lighting: false,
+            paint: Some([255, 0, 0]),
+            ..options(64, 64)
+        };
+
+        let render = |file_name_hash: u32| {
+            let mut paint_shader = shader(Some("white"), 0);
+            paint_shader.file_name_hash = file_name_hash;
+            let drawable = drawable(
+                vec![geometry(&vertices, quad_indices(), 0)],
+                ShaderGroup { textures: Vec::new(), shaders: vec![paint_shader] },
+            );
+            render_drawable(&drawable, &textures, &options).unwrap().0.get_pixel(32, 32).0
+        };
+
+        assert_eq!(render(rage_joaat("vehicle_paint1.sps")), [255, 0, 0, 255], "paint shader takes the tint");
+        assert_eq!(render(rage_joaat("vehicle_paint9.sps")), [255, 0, 0, 255], "every paint variant counts");
+        assert_eq!(render(rage_joaat("vehicle_tire.sps")), [255, 255, 255, 255], "other shaders are untouched");
+        assert!(is_vehicle_paint_shader(rage_joaat("vehicle_paint4_enveff.sps")));
+        assert!(!is_vehicle_paint_shader(rage_joaat("vehicle_mesh.sps")));
     }
 
     /// Render bucket 1 (alpha) blends, bucket 3 (cutout) discards below half

@@ -227,6 +227,11 @@ fn raster_triangle(
                     FLAT_GREY[3] as f32,
                 ],
             };
+            if let Some(tint) = g.tint {
+                texel[0] *= tint[0];
+                texel[1] *= tint[1];
+                texel[2] *= tint[2];
+            }
             let coverage = match g.blend {
                 BlendMode::Opaque => 1.0,
                 BlendMode::Cutout => {
@@ -481,6 +486,7 @@ mod tests {
             texture: None,
             has_normals: false,
             blend: BlendMode::Opaque,
+            tint: None,
         };
 
         let mut fb = Framebuffer::new(options.width, options.height, options.background);
@@ -506,6 +512,7 @@ mod tests {
             texture: Some(&red),
             has_normals: false,
             blend: BlendMode::Opaque,
+            tint: None,
         };
         let far = PreparedGeometry {
             verts: far_verts,
@@ -513,6 +520,7 @@ mod tests {
             texture: Some(&blue),
             has_normals: false,
             blend: BlendMode::Opaque,
+            tint: None,
         };
 
         let identity = Mat4::identity();
@@ -547,6 +555,7 @@ mod tests {
             texture: Some(&texture),
             has_normals: false,
             blend: BlendMode::Opaque,
+            tint: None,
         };
 
         let mut fb = Framebuffer::new(options.width, options.height, options.background);
@@ -576,6 +585,7 @@ mod tests {
             texture: Some(&transparent),
             has_normals: false,
             blend: BlendMode::Cutout,
+            tint: None,
         };
 
         let mut fb = Framebuffer::new(options.width, options.height, options.background);
@@ -595,6 +605,7 @@ mod tests {
             texture: Some(&transparent_red),
             has_normals: false,
             blend: BlendMode::Opaque,
+            tint: None,
         };
 
         let mut fb = Framebuffer::new(options.width, options.height, options.background);
@@ -615,6 +626,7 @@ mod tests {
             texture: Some(&half_red),
             has_normals: false,
             blend: BlendMode::Blend,
+            tint: None,
         };
 
         let mut fb = Framebuffer::new(options.width, options.height, [0, 0, 255, 255]);
@@ -638,6 +650,7 @@ mod tests {
             texture: Some(&half_red),
             has_normals: false,
             blend: BlendMode::Blend,
+            tint: None,
         };
 
         let mut fb = Framebuffer::new(options.width, options.height, [0, 0, 0, 0]);
@@ -662,6 +675,7 @@ mod tests {
             texture: Some(&half_red),
             has_normals: false,
             blend: BlendMode::Blend,
+            tint: None,
         };
         let far = PreparedGeometry {
             verts: far_verts,
@@ -669,6 +683,7 @@ mod tests {
             texture: Some(&blue),
             has_normals: false,
             blend: BlendMode::Opaque,
+            tint: None,
         };
 
         // A translucent surface drawn first must not block an opaque one
@@ -693,6 +708,7 @@ mod tests {
             texture: Some(&blue),
             has_normals: false,
             blend: BlendMode::Opaque,
+            tint: None,
         };
         let far = PreparedGeometry {
             verts: far_verts,
@@ -700,6 +716,7 @@ mod tests {
             texture: Some(&half_red),
             has_normals: false,
             blend: BlendMode::Blend,
+            tint: None,
         };
 
         let mut fb = Framebuffer::new(options.width, options.height, options.background);
@@ -738,6 +755,7 @@ mod tests {
             texture: Some(&red),
             has_normals: false,
             blend: BlendMode::Opaque,
+            tint: None,
         };
         let right = PreparedGeometry {
             verts: right_verts,
@@ -745,6 +763,7 @@ mod tests {
             texture: Some(&blue),
             has_normals: false,
             blend: BlendMode::Opaque,
+            tint: None,
         };
 
         let identity = Mat4::identity();
@@ -774,6 +793,7 @@ mod tests {
             texture: None,
             has_normals: false,
             blend: BlendMode::Opaque,
+            tint: None,
         };
 
         let mut fb = Framebuffer::new(options.width, options.height, options.background);
@@ -799,6 +819,7 @@ mod tests {
             texture: Some(&white),
             has_normals: false,
             blend: BlendMode::Opaque,
+            tint: None,
         };
 
         let mut fb = Framebuffer::new(options.width, options.height, options.background);
@@ -820,6 +841,7 @@ mod tests {
             texture: None,
             has_normals: false,
             blend: BlendMode::Opaque,
+            tint: None,
         };
 
         let mut fb = Framebuffer::new(options.width, options.height, options.background);

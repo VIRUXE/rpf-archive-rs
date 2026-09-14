@@ -170,7 +170,9 @@ let mut textures = TextureSet::new();
 textures.push_layer(&embedded_textures); // e.g. from the drawable's own shader group
 textures.push_layer(&shared_textures);   // lower-priority fallback layer
 
-let options = RenderOptions { view: View::Iso, ..Default::default() };
+// `paint` tints geometries drawn with a vehicle_paint*.sps shader: the YFT
+// carries no body colour, the game applies it at runtime from carcols.
+let options = RenderOptions { view: View::Iso, paint: Some([200, 30, 30]), ..Default::default() };
 let rendered = render_views(&drawable, &textures, &options, &View::ALL)?;
 for (view, image, report) in rendered {
     println!("{view}: {} triangle(s), {} missing texture(s)", report.triangles, report.missing_textures.len());
