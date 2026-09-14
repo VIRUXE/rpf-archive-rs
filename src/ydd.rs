@@ -1397,6 +1397,20 @@ fn read_indices(
 
 // ─── Drawable helpers ─────────────────────────────────────────────────────────
 
+impl DrawableModel {
+    /// Index of the bone this model hangs off: the top byte of the
+    /// skeleton binding.
+    pub fn bone_index(&self) -> usize {
+        ((self.skeleton_binding >> 24) & 0xFF) as usize
+    }
+
+    /// True for skinned meshes, whose vertices are already in skeleton
+    /// space and must not be moved with a single bone.
+    pub fn is_skinned(&self) -> bool {
+        (self.skeleton_binding >> 8) & 0xFF != 0
+    }
+}
+
 impl Drawable {
     pub fn lod(&self, level: LodLevel) -> Option<&DrawableLod> {
         self.lods.iter().find(|lod| lod.level == level)
@@ -1570,6 +1584,23 @@ pub(crate) mod tests {
             shader_group: None,
             lods: Vec::new(),
         }
+    }
+
+    /// The skeleton binding packs the bone index in its top byte and a
+    /// skin flag in its second byte (CodeWalker's `Renderable.Init`).
+    #[test]
+    fn model_bone_index_and_skin_flag_come_from_the_binding() {
+        let model = |skeleton_binding| DrawableModel {
+            skeleton_binding,
+            render_mask_flags: 0,
+            shader_mapping: Vec::new(),
+            geometries: Vec::new(),
+        };
+        assert_eq!(model(0).bone_index(), 0);
+        assert_eq!(model(5 << 24).bone_index(), 5);
+        assert!(!model(5 << 24).is_skinned());
+        assert!(model((5 << 24) | (1 << 8)).is_skinned());
+        assert_eq!(model((5 << 24) | (1 << 8)).bone_index(), 5);
     }
 
     #[test]

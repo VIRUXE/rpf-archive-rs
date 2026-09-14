@@ -10,7 +10,8 @@ mod textures;
 use anyhow::Result;
 use image::RgbaImage;
 
-use crate::ydd::{Drawable, LodLevel};
+use crate::math::{Mat4, Vec3};
+use crate::ydd::{Drawable, DrawableBounds, LodLevel};
 use raster::Framebuffer;
 
 pub use textures::TextureSet;
@@ -132,6 +133,33 @@ pub struct RenderReport {
     pub lod: Option<LodLevel>,
 }
 
+/// One drawable in a composite render, with where to put it.
+///
+/// A fragment's wheels and doors are separate drawables placed on the body
+/// by their physics transforms; `crate::yft::Fragment::render_parts` builds
+/// these. A plain drawable is a single part at the identity.
+#[derive(Debug, Clone, Copy)]
+pub struct RenderPart<'a> {
+    pub drawable: &'a Drawable,
+    /// Applied to every model of the drawable.
+    pub transform: Mat4,
+    /// Per-bone pose applied before `transform`, indexed by each model's
+    /// bone index; empty leaves every model where its vertices are.
+    pub bone_transforms: &'a [Mat4],
+}
+
+impl<'a> RenderPart<'a> {
+    pub fn new(drawable: &'a Drawable) -> Self {
+        Self { drawable, transform: Mat4::identity(), bone_transforms: &[] }
+    }
+}
+
+impl<'a> From<crate::yft::FragmentPart<'a>> for RenderPart<'a> {
+    fn from(part: crate::yft::FragmentPart<'a>) -> Self {
+        Self { drawable: part.drawable, transform: part.transform, bone_transforms: part.bone_transforms }
+    }
+}
+
 /// Renders `d` from `o.view`.
 ///
 /// A drawable with no geometry is not an error: the result is a
@@ -153,26 +181,53 @@ pub fn render_views(
     o: &RenderOptions,
     views: &[View],
 ) -> Result<Vec<(View, RgbaImage, RenderReport)>> {
+    render_parts(&[RenderPart::new(d)], tex, o, views)
+}
+
+/// Renders every part into one image per entry in `views`, preparing the
+/// meshes a single time. The camera frames all the parts together.
+///
+/// A single unmoved part keeps its drawable's stored bounds when they are
+/// sound (see `Drawable::bounds_or_computed`); anything else is framed by
+/// the bounds of the placed vertices, and the report says so.
+pub fn render_parts(
+    parts: &[RenderPart<'_>],
+    tex: &TextureSet,
+    o: &RenderOptions,
+    views: &[View],
+) -> Result<Vec<(View, RgbaImage, RenderReport)>> {
     let width = o.width.max(1);
     let height = o.height.max(1);
-
-    // The requested LOD when it has models, otherwise whatever the drawable
-    // actually carries.
-    let lod = d
-        .lod(o.lod)
-        .filter(|lod| !lod.models.is_empty())
-        .or_else(|| d.best_lod());
 
     let mut report = RenderReport::default();
     let mut geometries = Vec::new();
     let mut bounds = None;
 
-    if let Some(lod) = lod {
-        report.lod = Some(lod.level);
-        let (computed_bounds, was_computed) = d.bounds_or_computed(lod);
-        report.bounds_computed = was_computed;
-        geometries = mesh::prepare(d, lod, tex, o.paint, &mut report);
-        bounds = Some(computed_bounds);
+    let single_unmoved = parts.len() == 1
+        && parts[0].transform.is_identity()
+        && parts[0].bone_transforms.iter().all(Mat4::is_identity);
+
+    for part in parts {
+        let d = part.drawable;
+        // The requested LOD when it has models, otherwise whatever the
+        // drawable actually carries.
+        let Some(lod) = d.lod(o.lod).filter(|lod| !lod.models.is_empty()).or_else(|| d.best_lod())
+        else {
+            continue;
+        };
+
+        report.lod.get_or_insert(lod.level);
+        if single_unmoved {
+            let (stored_or_computed, was_computed) = d.bounds_or_computed(lod);
+            report.bounds_computed = was_computed;
+            bounds = Some(stored_or_computed);
+        }
+        geometries.extend(mesh::prepare(d, lod, &part.transform, part.bone_transforms, tex, o.paint, &mut report));
+    }
+
+    if !single_unmoved && !geometries.is_empty() {
+        report.bounds_computed = true;
+        bounds = Some(bounds_of(&geometries));
     }
 
     report.missing_textures.sort();
@@ -230,10 +285,35 @@ pub fn render_views(
     Ok(out)
 }
 
+/// Axis-aligned bounds of every finite vertex across the prepared geometry.
+fn bounds_of(geometries: &[mesh::PreparedGeometry<'_>]) -> DrawableBounds {
+    let mut min = Vec3::new(f32::INFINITY, f32::INFINITY, f32::INFINITY);
+    let mut max = Vec3::new(f32::NEG_INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY);
+
+    for vertex in geometries.iter().flat_map(|geometry| &geometry.verts) {
+        let p = vertex.position;
+        if p.x.is_finite() && p.y.is_finite() && p.z.is_finite() {
+            min = min.min(p);
+            max = max.max(p);
+        }
+    }
+
+    if min.x > max.x {
+        return DrawableBounds { center: Vec3::ZERO, sphere_radius: 0.0, box_min: Vec3::ZERO, box_max: Vec3::ZERO };
+    }
+
+    DrawableBounds {
+        center: (min + max) * 0.5,
+        sphere_radius: (max - min).length() * 0.5,
+        box_min: min,
+        box_max: max,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::math::{Vec2, Vec3};
+    use crate::math::{Mat4, Vec2, Vec3};
     use crate::writer::rage_joaat;
     use crate::ydd::{
         Drawable, DrawableBounds, DrawableGeometry, DrawableLod, DrawableModel, IndexBuffer,
@@ -613,6 +693,69 @@ mod tests {
         let pixel = image.get_pixel(32, 32).0;
         assert!((pixel[0] as i32 - 128).abs() <= 2, "near red on top: {pixel:?}");
         assert!((pixel[1] as i32 - 64).abs() <= 2, "far green underneath: {pixel:?}");
+    }
+
+    /// Two identical quads, one part translated 3 units along X, frame as a
+    /// 5-wide by 2-tall silhouette from the front instead of overlapping.
+    #[test]
+    fn parts_are_placed_by_their_transform() {
+        let quad = drawable(vec![geometry(&quad_vertices(), quad_indices(), 0)], shader_group(None));
+        let parts = [
+            RenderPart::new(&quad),
+            RenderPart { transform: Mat4::from_translation(Vec3::new(3.0, 0.0, 0.0)), ..RenderPart::new(&quad) },
+        ];
+        let options = RenderOptions { view: View::Front, ..options(200, 200) };
+        let rendered = render_parts(&parts, &TextureSet::new(), &options, &[View::Front]).unwrap();
+        let (_, image, report) = &rendered[0];
+
+        assert_eq!(report.triangles, 4);
+        assert!(report.bounds_computed, "composite bounds come from the placed vertices");
+        let ratio = silhouette_ratio(image, options.background);
+        assert!((ratio - 2.5).abs() < 0.15, "silhouette ratio {ratio} != 2.5");
+    }
+
+    /// A model bound to bone 1 moves with that bone's pose; a skinned model
+    /// bound to the same bone does not.
+    #[test]
+    fn models_are_posed_by_their_bone_index_unless_skinned() {
+        let bone_transforms = [Mat4::identity(), Mat4::from_translation(Vec3::new(3.0, 0.0, 0.0))];
+        let two_models = |second_binding: u32| {
+            let mut d = drawable(vec![geometry(&quad_vertices(), quad_indices(), 0)], shader_group(None));
+            d.lods[0].models.push(DrawableModel {
+                skeleton_binding: second_binding,
+                render_mask_flags: 0,
+                shader_mapping: vec![0],
+                geometries: vec![geometry(&quad_vertices(), quad_indices(), 0)],
+            });
+            d
+        };
+        let options = RenderOptions { view: View::Front, ..options(200, 200) };
+        let ratio = |d: &Drawable| {
+            let parts = [RenderPart { bone_transforms: &bone_transforms, ..RenderPart::new(d) }];
+            let rendered = render_parts(&parts, &TextureSet::new(), &options, &[View::Front]).unwrap();
+            silhouette_ratio(&rendered[0].1, options.background)
+        };
+
+        let posed = ratio(&two_models(1 << 24));
+        assert!((posed - 2.5).abs() < 0.15, "bone 1 model not moved by the pose: {posed}");
+
+        let skinned = ratio(&two_models((1 << 24) | (1 << 8)));
+        assert!((skinned - 1.0).abs() < 0.15, "skinned model should ignore the pose: {skinned}");
+    }
+
+    /// `render_views` is the single-part case and keeps reporting the
+    /// drawable's own bounds as stored when they are good.
+    #[test]
+    fn single_part_keeps_stored_bounds() {
+        let mut cube = box_drawable(Vec3::new(0.5, 0.5, 0.5));
+        cube.bounds = DrawableBounds {
+            center: Vec3::ZERO,
+            sphere_radius: 0.87,
+            box_min: Vec3::new(-0.5, -0.5, -0.5),
+            box_max: Vec3::new(0.5, 0.5, 0.5),
+        };
+        let (_, report) = render_drawable(&cube, &TextureSet::new(), &options(32, 32)).unwrap();
+        assert!(!report.bounds_computed);
     }
 
     #[test]
