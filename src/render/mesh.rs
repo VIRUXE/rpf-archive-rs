@@ -115,7 +115,10 @@ pub(crate) fn prepare<'a>(
                         None
                     }
                 },
-                None => None,
+                None => {
+                    report.geometries_without_diffuse += 1;
+                    None
+                }
             };
             if texture.is_none() {
                 report.untextured_geometries += 1;

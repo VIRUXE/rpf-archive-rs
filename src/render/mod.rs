@@ -127,6 +127,10 @@ pub struct RenderReport {
     /// Geometries drawn in flat grey — whether the name was missing or the
     /// shader had no diffuse parameter at all.
     pub untextured_geometries: usize,
+    /// The subset of `untextured_geometries` whose shader names no diffuse
+    /// texture in the first place, so no texture set could have supplied
+    /// one. The rest are listed by name in `missing_textures`.
+    pub geometries_without_diffuse: usize,
     /// True when the drawable's stored bounds were degenerate and had to be
     /// rebuilt from the vertices.
     pub bounds_computed: bool,
@@ -773,6 +777,7 @@ mod tests {
         assert_eq!(report.triangles, 2);
         assert_eq!(report.geometries, 1);
         assert_eq!(report.untextured_geometries, 1);
+        assert_eq!(report.geometries_without_diffuse, 0, "the shader did name a texture");
         assert!(report.bounds_computed);
         assert_eq!(report.lod, Some(LodLevel::High));
 
@@ -781,6 +786,20 @@ mod tests {
         assert_eq!(centre[0], centre[1]);
         assert_eq!(centre[1], centre[2]);
         assert_eq!(centre[3], 255);
+    }
+
+    /// A shader with no diffuse parameter is untextured too, but nothing
+    /// is missing: no `--ytd` could fix it, so it is counted apart.
+    #[test]
+    fn shader_without_a_diffuse_parameter_is_counted_separately() {
+        let vertices = quad_vertices();
+        let drawable = drawable(vec![geometry(&vertices, quad_indices(), 0)], shader_group(None));
+
+        let (_, report) = render_drawable(&drawable, &TextureSet::new(), &options(16, 16)).unwrap();
+
+        assert!(report.missing_textures.is_empty());
+        assert_eq!(report.untextured_geometries, 1);
+        assert_eq!(report.geometries_without_diffuse, 1);
     }
 
     /// A 1 x 2 x 3 box looks different from every side, so a swapped view
