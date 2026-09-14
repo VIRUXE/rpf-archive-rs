@@ -1107,11 +1107,15 @@ pub(crate) mod tests {
         assert_eq!(names, vec!["0x00000007", "0x00000007_1", "other"]);
     }
 
+    /// A pointer into neither section: the fallbacks below have to trigger
+    /// on a stream that fails to resolve, not only on a null pointer.
+    const NOWHERE: u64 = SYSTEM_BASE + 0x10_0000;
+
     #[test]
     fn datapointer2_fallback() {
         let (mut system, graphics) = minimal_ydr_sections(false);
-        // Clear DataPointer1 and move the stream to DataPointer2.
-        write_u64(&mut system, 0x480 + 0x10, 0);
+        // Point DataPointer1 off the end and move the stream to DataPointer2.
+        write_u64(&mut system, 0x480 + 0x10, NOWHERE);
         write_u64(&mut system, 0x480 + 0x20, GRAPHICS_BASE);
 
         let reader = sections_reader(&system, &graphics);
@@ -1129,9 +1133,9 @@ pub(crate) mod tests {
     #[test]
     fn gen9_vertex_buffer_fallback() {
         let (mut system, graphics) = minimal_ydr_sections(false);
-        // Clear both legacy data pointers, then lay out the Gen9 fields.
-        write_u64(&mut system, 0x480 + 0x10, 0);
-        write_u64(&mut system, 0x480 + 0x20, 0);
+        // Break both legacy data pointers, then lay out the Gen9 fields.
+        write_u64(&mut system, 0x480 + 0x10, NOWHERE);
+        write_u64(&mut system, 0x480 + 0x20, NOWHERE);
         write_u32(&mut system, 0x480 + 0x08, 3); // vertex count
         write_u16(&mut system, 0x480 + 0x0C, 12); // stride
         write_u64(&mut system, 0x480 + 0x18, GRAPHICS_BASE); // data
@@ -1148,13 +1152,51 @@ pub(crate) mod tests {
         assert_eq!(buffer.vertex_stride, 12);
         assert_eq!(buffer.data.len(), 36);
         assert!(buffer.declaration.is_none());
+        // Gen9 stores no declaration, so the legacy info slot is meaningless
+        // and must not be reported as though it pointed at one.
+        assert_eq!(buffer.info_pointer, 0);
+    }
+
+    /// Gen9 index buffers carry an explicit index size and keep the data one
+    /// field further along; with a 4-byte size the indices are read as u32.
+    #[test]
+    fn gen9_index_buffer_reads_u32_indices() {
+        let (mut system, mut graphics) = minimal_ydr_sections(false);
+        write_u64(&mut system, 0x580 + 0x10, NOWHERE);
+        write_u16(&mut system, 0x580 + 0x0C, 4);
+        write_u64(&mut system, 0x580 + 0x18, GRAPHICS_BASE + 0x100);
+        write_u32(&mut graphics, 0x100, 2);
+        write_u32(&mut graphics, 0x104, 0x0001_0000);
+        write_u32(&mut graphics, 0x108, 1);
+
+        let reader = sections_reader(&system, &graphics);
+        let drawable = parse_drawable_at(&reader, SYSTEM_BASE, 0xA8, 0xD0, None).unwrap();
+        let indices = &drawable.lods[0].models[0].geometries[0].index_buffer.as_ref().unwrap().indices;
+
+        assert_eq!(*indices, vec![2, 0x0001_0000, 1]);
+    }
+
+    /// Some resources leave the High LOD list null and point at the models
+    /// through DrawableModelsPointer (0xA0) instead.
+    #[test]
+    fn high_lod_falls_back_to_the_models_pointer() {
+        let (mut system, graphics) = minimal_ydr_sections(false);
+        write_u64(&mut system, 0x50, 0);
+        write_u64(&mut system, 0xA0, SYSTEM_BASE + 0x200);
+
+        let reader = sections_reader(&system, &graphics);
+        let drawable = parse_drawable_at(&reader, SYSTEM_BASE, 0xA8, 0xD0, None).unwrap();
+
+        assert_eq!(drawable.lods.len(), 1);
+        assert_eq!(drawable.lods[0].level, LodLevel::High);
+        assert_eq!(drawable.lods[0].models.len(), 1);
     }
 
     #[test]
     fn geometry_inline_fallback() {
         let (mut system, graphics) = minimal_ydr_sections(false);
-        // No vertex buffer struct at all: fall back to the inline geometry data.
-        write_u64(&mut system, 0x300 + 0x18, 0);
+        // No usable vertex buffer struct: fall back to the inline geometry data.
+        write_u64(&mut system, 0x300 + 0x18, NOWHERE);
 
         let reader = sections_reader(&system, &graphics);
         let drawable = parse_drawable_at(&reader, SYSTEM_BASE, 0xA8, 0xD0, None).unwrap();

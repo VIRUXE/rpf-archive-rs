@@ -178,11 +178,13 @@ pub(crate) fn parse_vertex_buffer_at(
         let gen9_stride = u16_le(raw, 0x0C);
         let gen9_pointer = u64_le(raw, 0x18);
         if let Some(data) = read_vertex_data(reader, gen9_pointer, gen9_count, gen9_stride) {
+            // The legacy info slot holds something else in this layout, so
+            // it is not reported as a declaration pointer.
             return Some(VertexBuffer {
                 vertex_stride: gen9_stride,
                 vertex_count: gen9_count,
                 data_pointer: gen9_pointer,
-                info_pointer,
+                info_pointer: 0,
                 declaration: None,
                 data,
                 layout: VertexBufferLayout::Gen9,
@@ -682,4 +684,147 @@ fn f16_to_f32(value: u16) -> f32 {
 
 fn snorm8_to_f32(value: u8) -> f32 {
     ((value as i8) as f32 / 127.0).max(-1.0)
+}
+
+// ─── Tests ────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn component(semantic: VertexSemantic, ty: VertexComponentType, offset: u16) -> VertexComponent {
+        VertexComponent {
+            semantic,
+            semantic_index: 0,
+            component_type: ty,
+            offset,
+            size: ty.size_in_bytes(),
+            component_count: ty.component_count(),
+        }
+    }
+
+    /// A one-vertex buffer laid out exactly as `components` says.
+    fn buffer(components: Vec<VertexComponent>, data: Vec<u8>) -> VertexBuffer {
+        let stride = data.len() as u16;
+        VertexBuffer {
+            vertex_stride: stride,
+            vertex_count: 1,
+            data_pointer: 0,
+            info_pointer: 0,
+            declaration: Some(VertexDeclaration {
+                flags: 0,
+                stride,
+                unknown_6h: 0,
+                count: components.len() as u8,
+                types: 0,
+                components,
+            }),
+            data,
+            layout: VertexBufferLayout::Legacy,
+        }
+    }
+
+    #[test]
+    fn f16_covers_normals_subnormals_and_infinities() {
+        assert_eq!(f16_to_f32(0x3C00), 1.0);
+        assert_eq!(f16_to_f32(0xC000), -2.0);
+        assert_eq!(f16_to_f32(0x3555), 0.333_251_95);
+        assert_eq!(f16_to_f32(0x0001), 2f32.powi(-24), "smallest subnormal");
+        assert_eq!(f16_to_f32(0x8000), -0.0);
+        assert_eq!(f16_to_f32(0x7C00), f32::INFINITY);
+        assert!(f16_to_f32(0x7E00).is_nan());
+    }
+
+    #[test]
+    fn snorm8_maps_the_byte_range_onto_minus_one_to_one() {
+        assert_eq!(snorm8_to_f32(0x7F), 1.0);
+        assert_eq!(snorm8_to_f32(0x00), 0.0);
+        assert_eq!(snorm8_to_f32(0x81), -1.0);
+        assert_eq!(snorm8_to_f32(0x80), -1.0, "-128 clamps rather than overshooting");
+    }
+
+    /// Every component type the game uses decodes to the value the bytes
+    /// spell, and `Unsupported` for the ones that carry no data.
+    #[test]
+    fn each_component_type_decodes_its_bytes() {
+        let decode = |ty, bytes: &[u8]| read_vertex_attribute_value(bytes, 0, ty).unwrap();
+
+        assert_eq!(decode(VertexComponentType::Half2, &[0x00, 0x3C, 0x00, 0xC0]), VertexAttributeValue::Half2([1.0, -2.0]));
+        assert_eq!(
+            decode(VertexComponentType::Half4, &[0x00, 0x3C, 0x00, 0xC0, 0x00, 0x00, 0x00, 0x38]),
+            VertexAttributeValue::Half4([1.0, -2.0, 0.0, 0.5])
+        );
+        assert_eq!(decode(VertexComponentType::Float, &1.5f32.to_le_bytes()), VertexAttributeValue::Float(1.5));
+        let mut two = 1.5f32.to_le_bytes().to_vec();
+        two.extend_from_slice(&(-4.0f32).to_le_bytes());
+        assert_eq!(decode(VertexComponentType::Float2, &two), VertexAttributeValue::Float2([1.5, -4.0]));
+        assert_eq!(decode(VertexComponentType::UByte4, &[1, 2, 3, 4]), VertexAttributeValue::UByte4([1, 2, 3, 4]));
+        assert_eq!(decode(VertexComponentType::Colour, &[10, 20, 30, 40]), VertexAttributeValue::Colour([10, 20, 30, 40]));
+        assert_eq!(
+            decode(VertexComponentType::Rgba8Snorm, &[0x7F, 0x81, 0x00, 0x80]),
+            VertexAttributeValue::Rgba8Snorm([1.0, -1.0, 0.0, -1.0])
+        );
+        assert_eq!(decode(VertexComponentType::Nothing, &[]), VertexAttributeValue::Unsupported);
+        assert_eq!(decode(VertexComponentType::Unknown(13), &[]), VertexAttributeValue::Unsupported);
+    }
+
+    #[test]
+    fn a_short_buffer_is_an_error_not_a_panic() {
+        assert!(read_vertex_attribute_value(&[0, 0], 0, VertexComponentType::Float).is_err());
+        assert!(read_vertex_attribute_value(&[0; 4], 2, VertexComponentType::Float).is_err());
+    }
+
+    /// The compact layouts real drawables use: a half-float UV, a packed
+    /// snorm normal, a byte colour and byte blend indices all reach the
+    /// unified vertex as the renderer expects them.
+    #[test]
+    fn unified_vertex_is_built_from_packed_components() {
+        let components = vec![
+            component(VertexSemantic::Position, VertexComponentType::Float3, 0),
+            component(VertexSemantic::Normal, VertexComponentType::Rgba8Snorm, 12),
+            component(VertexSemantic::Colour0, VertexComponentType::Colour, 16),
+            component(VertexSemantic::TexCoord0, VertexComponentType::Half2, 20),
+            component(VertexSemantic::BlendIndices, VertexComponentType::UByte4, 24),
+            component(VertexSemantic::Tangent, VertexComponentType::Half4, 28),
+        ];
+        let mut data = Vec::new();
+        for value in [1.0f32, 2.0, 3.0] {
+            data.extend_from_slice(&value.to_le_bytes());
+        }
+        data.extend_from_slice(&[0x00, 0x00, 0x7F, 0x00]); // normal +Z
+        data.extend_from_slice(&[10, 20, 30, 40]); // colour
+        data.extend_from_slice(&[0x00, 0x38, 0x00, 0x3C]); // uv (0.5, 1.0)
+        data.extend_from_slice(&[5, 6, 7, 8]); // blend indices
+        data.extend_from_slice(&[0x00, 0x3C, 0x00, 0x00, 0x00, 0x00, 0x00, 0xBC]); // tangent (1,0,0,-1)
+
+        let vertices = buffer(components, data).to_unified_vertices().unwrap();
+
+        assert_eq!(vertices.len(), 1);
+        let v = vertices[0];
+        assert_eq!(v.position, Vec3::new(1.0, 2.0, 3.0));
+        assert_eq!(v.normal, Vec3::new(0.0, 0.0, 1.0));
+        assert_eq!(v.color0, [10, 20, 30, 40]);
+        assert_eq!(v.texcoord0, Vec2::new(0.5, 1.0));
+        assert_eq!(v.blend_indices, [5, 6, 7, 8]);
+        assert_eq!(v.tangent, Vec4::new(1.0, 0.0, 0.0, -1.0));
+    }
+
+    /// Colours stored as floats or snorm bytes are requantised to 0..=255.
+    #[test]
+    fn colours_are_requantised_from_float_and_snorm() {
+        let float = VertexAttributeValue::Float4(Vec4::new(1.0, 0.5, 0.0, 2.0));
+        assert_eq!(float.as_rgba8(), [255, 127, 0, 255]);
+
+        let snorm = VertexAttributeValue::Rgba8Snorm([1.0, -1.0, 0.0, 1.0]);
+        assert_eq!(snorm.as_rgba8(), [255, 0, 127, 255]);
+
+        assert_eq!(VertexAttributeValue::Unsupported.as_rgba8(), [255, 255, 255, 255]);
+    }
+
+    #[test]
+    fn reading_past_the_vertex_count_is_an_error() {
+        let one = buffer(vec![component(VertexSemantic::Position, VertexComponentType::Float, 0)], vec![0; 4]);
+        assert!(one.read_vertex_attributes(0).is_ok());
+        assert!(one.read_vertex_attributes(1).is_err());
+    }
 }
