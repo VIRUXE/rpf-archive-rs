@@ -218,6 +218,8 @@ pub fn to_rgba_image(tex: &YtdTexture) -> Result<image::RgbaImage> {
 pub fn fit_max_size(img: image::RgbaImage, max_edge: u32) -> image::RgbaImage {
     let (width, height) = img.dimensions();
     let longest = width.max(height);
+    // An empty image has nothing to scale, and `max_edge / 0` below would
+    // divide by zero; it is handed back as it is.
     if longest <= max_edge || longest == 0 {
         return img;
     }
@@ -285,11 +287,15 @@ pub fn encode_image(img: &image::RgbaImage, format: ImageFormat, quality: u8) ->
             )?;
         }
         ImageFormat::Jpeg => {
-            let rgb_img: image::RgbImage = image::DynamicImage::ImageRgba8(img.clone()).to_rgb8();
+            // JPEG has no alpha: drop the fourth byte of every pixel straight
+            // into the RGB buffer rather than cloning the image into a
+            // `DynamicImage` for `to_rgb8` to do the same.
+            let rgb: Vec<u8> =
+                img.as_raw().chunks_exact(4).flat_map(|pixel| [pixel[0], pixel[1], pixel[2]]).collect();
             let encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buf, quality);
             image::ImageEncoder::write_image(
                 encoder,
-                rgb_img.as_raw(),
+                &rgb,
                 width,
                 height,
                 image::ExtendedColorType::Rgb8,
@@ -520,6 +526,22 @@ mod tests {
         let img = image::RgbaImage::new(50, 50);
         let resized = fit_max_size(img, 100);
         assert_eq!(resized.dimensions(), (50, 50));
+
+        let resized = fit_max_size(image::RgbaImage::new(0, 0), 100);
+        assert_eq!(resized.dimensions(), (0, 0));
+    }
+
+    /// A JPEG is encoded from a hand-packed RGB buffer, so a channel slip
+    /// there would swap colours without changing the image's size.
+    #[test]
+    fn jpeg_keeps_the_colours_in_order() {
+        let img = image::RgbaImage::from_pixel(8, 8, image::Rgba([200, 40, 90, 255]));
+        let bytes = encode_image(&img, ImageFormat::Jpeg, 100).unwrap();
+        let decoded = image::load_from_memory(&bytes).unwrap().to_rgba8();
+        let pixel = decoded.get_pixel(4, 4).0;
+        for (channel, wanted) in pixel[..3].iter().zip([200u8, 40, 90]) {
+            assert!(channel.abs_diff(wanted) <= 4, "decoded {pixel:?}");
+        }
     }
 
     #[test]
