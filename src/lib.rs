@@ -5,6 +5,7 @@ pub mod writer;
 pub mod ytd;
 pub mod resource;
 pub mod ydd;
+pub mod vertex;
 pub mod texture_utils;
 pub mod wasm;
 pub mod ymt;
