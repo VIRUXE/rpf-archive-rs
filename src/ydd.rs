@@ -1587,6 +1587,8 @@ pub(crate) mod tests {
                 DrawableEntry { hash: rage_joaat("frag"), name: "frag".to_string(), drawable: stub_drawable("frag") },
                 DrawableEntry { hash: rage_joaat("frag"), name: "frag".to_string(), drawable: stub_drawable("frag") },
             ],
+            bone_transforms: Vec::new(),
+            children: Vec::new(),
         };
 
         let entries = assemble_fragment_entries(fragment);
