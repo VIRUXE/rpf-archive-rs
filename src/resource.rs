@@ -14,6 +14,12 @@ pub struct ResReader<'a> {
     pub graphics: &'a [u8],
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Section {
+    System,
+    Graphics,
+}
+
 /// Header of a `atArray`/pointer-list style structure: a pointer to the
 /// backing array, followed by a `u16` count and a `u16` capacity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -24,17 +30,30 @@ pub struct PointerListHeader {
 }
 
 impl<'a> ResReader<'a> {
-    pub fn resolve(&self, va: u64, len: usize) -> Option<&'a [u8]> {
-        if va == 0 { return None; }
-        if (va & 0x50000000) == 0x50000000 && (va & 0x60000000) != 0x60000000 {
-            let off = (va - 0x50000000) as usize;
-            self.system.get(off..off.checked_add(len)?)
-        } else if (va & 0x60000000) == 0x60000000 {
-            let off = (va - 0x60000000) as usize;
-            self.graphics.get(off..off.checked_add(len)?)
+    /// Which section a virtual address points into, and the offset within it.
+    /// Both bases share bit 30; bit 29 marks graphics and bit 28 system. An
+    /// address with all three set counts as graphics, as it always has.
+    fn locate(&self, va: u64) -> Option<(Section, usize)> {
+        if va & GRAPHICS_BASE == GRAPHICS_BASE {
+            Some((Section::Graphics, (va - GRAPHICS_BASE) as usize))
+        } else if va & SYSTEM_BASE == SYSTEM_BASE {
+            Some((Section::System, (va - SYSTEM_BASE) as usize))
         } else {
             None
         }
+    }
+
+    fn section(&self, which: Section) -> &'a [u8] {
+        match which {
+            Section::System => self.system,
+            Section::Graphics => self.graphics,
+        }
+    }
+
+    pub fn resolve(&self, va: u64, len: usize) -> Option<&'a [u8]> {
+        if va == 0 { return None; }
+        let (section, off) = self.locate(va)?;
+        self.section(section).get(off..off.checked_add(len)?)
     }
 
     /// Like [`Self::resolve`], but distinguishes a null pointer (`va == 0`,
@@ -86,16 +105,16 @@ impl<'a> ResReader<'a> {
     /// unresolved string (`None`) rather than returned truncated.
     const MAX_STRING_LEN: usize = 256;
 
+    /// Names only ever live in the system section; a graphics-section
+    /// address is treated as unresolved.
     pub fn string_at(&self, va: u64) -> Option<String> {
-        if (va & 0x50000000) == 0x50000000 && (va & 0x60000000) != 0x60000000 {
-            let off = (va - 0x50000000) as usize;
-            let slice = self.system.get(off..)?;
-            let scan_len = slice.len().min(Self::MAX_STRING_LEN);
-            let end = slice[..scan_len].iter().position(|&b| b == 0)?;
-            Some(String::from_utf8_lossy(&slice[..end]).into_owned())
-        } else {
-            None
-        }
+        let (Section::System, off) = self.locate(va)? else {
+            return None;
+        };
+        let slice = self.system.get(off..)?;
+        let scan_len = slice.len().min(Self::MAX_STRING_LEN);
+        let end = slice[..scan_len].iter().position(|&b| b == 0)?;
+        Some(String::from_utf8_lossy(&slice[..end]).into_owned())
     }
 }
 
