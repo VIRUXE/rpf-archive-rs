@@ -215,4 +215,41 @@ mod tests {
         assert_eq!(mesh["positions"].len(), 9);
         assert_eq!(mesh["indices"].len(), 3);
     }
+
+    /// A YDR that the dictionary parser rejects: its header carries a
+    /// non-empty pointer array at 0x30 that points nowhere, and no LOD list
+    /// resolves either, so `parse_drawables(.., Ydd)` fails and the input
+    /// only parses as a single drawable.
+    fn ydr_rejected_as_dictionary() -> Vec<u8> {
+        let (mut system, graphics) = minimal_ydr_sections(false);
+        let nowhere = crate::resource::SYSTEM_BASE + 0x10_0000;
+        system[0x30..0x38].copy_from_slice(&nowhere.to_le_bytes());
+        system[0x38..0x3A].copy_from_slice(&1u16.to_le_bytes());
+        system[0x3A..0x3C].copy_from_slice(&1u16.to_le_bytes());
+        system[0x50..0x58].copy_from_slice(&nowhere.to_le_bytes());
+        wrap_rsc7(&system, &graphics)
+    }
+
+    #[test]
+    fn falls_back_to_the_ydr_parser_when_the_dictionary_parser_fails() {
+        let bytes = ydr_rejected_as_dictionary();
+        assert!(parse_drawables(&bytes, DrawableKind::Ydd).is_err(), "fixture must fail as a Ydd");
+
+        let output = inner_convert(&bytes, &[]).expect("Ydr fallback should convert");
+        let root = json::parse(&String::from_utf8(output).unwrap()).unwrap();
+        assert_eq!(root["drawables"].len(), 1);
+        assert_eq!(root["drawables"][0]["name"], "test_drawable");
+    }
+
+    #[test]
+    fn drawable_without_models_reports_lod_none_and_stored_bounds() {
+        let bytes = ydr_rejected_as_dictionary();
+        let output = inner_convert(&bytes, &[]).unwrap();
+        let root = json::parse(&String::from_utf8(output).unwrap()).unwrap();
+
+        let drawable = &root["drawables"][0];
+        assert_eq!(drawable["lod"], "none");
+        assert_eq!(drawable["meshes"].len(), 0);
+        assert_eq!(drawable["bounds"]["radius"], 10.0);
+    }
 }
