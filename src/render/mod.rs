@@ -73,6 +73,10 @@ pub struct RenderOptions {
     pub view: View,
     pub background: [u8; 4],
     pub lod: LodLevel,
+    /// Drop triangles wound clockwise on screen. Retail drawables wind their
+    /// front faces counter-clockwise (checked on props and on a vehicle with
+    /// its mirrored wheels), but many GTA surfaces are single-sided planes
+    /// meant to be seen from either side, so this is off by default.
     pub backface_cull: bool,
     pub vertex_colors: bool,
     pub lighting: bool,

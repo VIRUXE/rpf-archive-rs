@@ -216,6 +216,23 @@ One line each on two smaller pieces the renderer and CLI build on:
   table) draw simple pixel labels directly onto an `RgbaImage`, with no font
   file or text-shaping dependency.
 
+## Changes in 0.9.1
+
+- `Drawable::diffuse_texture_name` falls back to the `TextureSampler`
+  parameter (`TEXTURE_SAMPLER`), so drawables converted from the GTA IV /
+  Max Payne 3 pipelines no longer render untextured.
+- `RenderReport::geometries_without_diffuse` counts the untextured
+  geometries whose shader names no diffuse texture at all, apart from the
+  ones listed in `missing_textures`.
+- The vertex layer (`VertexBuffer`, `VertexDeclaration`, component types and
+  decoding) lives in the new `vertex` module; every `ydd::` path still works.
+  A Gen9 vertex buffer now reports `info_pointer` as 0 rather than the
+  legacy slot's unrelated contents.
+- Eighteen `FONT_5X7` glyphs that had drifted from Adafruit's `glcdfont.c`
+  are back to the reference shapes.
+- Back-face culling was checked against retail drawables: counter-clockwise
+  front faces are the ones kept, on mirrored wheels too.
+
 ## Changes in 0.9.0
 
 - `Fragment` now carries its physics children (`children`) and default bone
