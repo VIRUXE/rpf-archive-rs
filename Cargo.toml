@@ -25,3 +25,4 @@ gltf = { version = "1.4", default-features = false, features = ["utils", "names"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
 texture2ddecoder = "0.1"
 json = "0.12"
+roxmltree = "0.20"
