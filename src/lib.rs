@@ -14,6 +14,7 @@ pub mod yft;
 pub mod font;
 pub mod sheet;
 pub mod render;
+pub mod ytyp;
 mod tests;
 
 pub use archive::{RpfArchive, RpfEntry, RpfEntryKind, RpfEncryption, RpfFile, RpfVersion,
@@ -33,6 +34,7 @@ pub use ydd::{parse_ydd, parse_ydr, parse_drawables, Drawable, DrawableBounds, D
 pub use yft::{parse_yft, wheel_slot, Fragment, FragmentChild, FragmentPart, WheelSlot};
 pub use wasm::convert_to_gltf;
 pub use ymt::{parse_ymt, PedVariationInfo};
+pub use ytyp::{parse_archetype_txds, ArchetypeTxd};
 pub use math::{Vec2, Vec3, Vec4, Mat4};
 pub use resource::{SYSTEM_BASE, GRAPHICS_BASE};
 pub use font::{draw_text, text_width, FONT_5X7, GLYPH_H, GLYPH_W};
