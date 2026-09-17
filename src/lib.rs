@@ -15,6 +15,7 @@ pub mod font;
 pub mod sheet;
 pub mod render;
 pub mod ytyp;
+mod rbf;
 mod tests;
 
 pub use archive::{RpfArchive, RpfEntry, RpfEntryKind, RpfEncryption, RpfFile, RpfVersion,
