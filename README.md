@@ -1,32 +1,56 @@
 # rpf-archive
 
-Rust library for reading and writing Rockstar Games archive formats — RPF (Rockstar Package File) and IMG — across GTA III through Red Dead Redemption 2.
-
-## Supported formats
-
-| Version | Game(s) | Magic |
-|---------|---------|-------|
-| IMG1 | GTA III, Vice City | *(none — paired `.dir`+`.img`)* |
-| IMG2 | GTA San Andreas | `VER2` |
-| IMG3 | RAGE / modding tools | `0xA94E2A52` |
-| RPF0 | Table Tennis | `RPF0` |
-| RPF2 | GTA IV | `RPF2` |
-| RPF3 | GTA IV Audio / MCLA | `RPF3` |
-| RPF4 | Max Payne 3 | `RPF4` |
-| RPF6 | Red Dead Redemption | `RPF6` |
-| RPF7 | GTA V / FiveM | `RPF7` |
-| RPF8 | Red Dead Redemption 2 | `RPF8` *(read-only)* |
-
-## Usage
-
-Add to `Cargo.toml`:
+Rust library for reading and writing Rockstar Games archive formats, RPF
+(Rockstar Package File) and IMG, across GTA III through Red Dead Redemption
+2. Archives only: what is inside them is parsed by
+[`rage-formats`](https://github.com/VIRUXE/rage-formats), drawn by
+[`rage-render`](https://github.com/VIRUXE/rage-render), and driven from the
+command line by [`rage-cli`](https://github.com/VIRUXE/rage-cli).
 
 ```toml
 [dependencies]
 rpf-archive = "0.10"
 ```
 
-### Reading an RPF archive (RPF2–RPF7)
+## Supported formats
+
+| Version | Game(s) | Magic | Read | Write |
+|---------|---------|-------|:-:|:-:|
+| IMG1 | GTA III, Vice City | *(none; paired `.dir`+`.img`)* | yes | yes |
+| IMG2 | GTA San Andreas | `VER2` | yes | yes |
+| IMG3 | RAGE / modding tools | `0xA94E2A52` | yes | yes |
+| RPF0 | Table Tennis | `RPF0` | yes | yes |
+| RPF2 | GTA IV | `RPF2` | yes | yes |
+| RPF3 | GTA IV Audio / MCLA | `RPF3` | yes | yes |
+| RPF4 | Max Payne 3 | `RPF4` | yes | yes |
+| RPF6 | Red Dead Redemption | `RPF6` | yes | yes |
+| RPF7 | GTA V / FiveM | `RPF7` | yes | yes |
+| RPF8 | Red Dead Redemption 2 | `RPF8` | yes | |
+
+## What the crate covers
+
+- **Reading**: the table of contents, directory tree, entry kinds (binary
+  files, RSC7 resources with their page flags, nested archives) and
+  extraction with decompression.
+- **Encryption**: GTA V's AES and NG schemes. `GtaKeys` loads keys written
+  out to disk; recovering them from `GTA5.exe` is `rage-cli`'s job (see its
+  Keys section), this crate only consumes them. Open (unencrypted) archives,
+  the kind FiveM resources use, need no keys.
+- **Writing**: `RpfBuilder` assembles an archive of any supported version
+  from paths and bytes, with the encryption you choose; RSC7 resources are
+  detected by magic and recorded with the right flags.
+- **Load order**: `parse_dlc_list` and `parse_dlc_setup_order` read
+  `dlclist.xml` and each pack's `setup2.xml`, which is how a consumer ranks
+  archives the way the game does (base, `update.rpf`, then DLC packs in
+  order, later wins).
+- **Resource sizes**: `resource_size_from_flags` and
+  `resource_version_from_flags` decode an RSC7 entry's header words, since
+  an archive listing needs them; `rage-formats` exports the same values for
+  loose files.
+
+## Usage
+
+### Reading an RPF archive (RPF2 to RPF7)
 
 ```rust
 use rpf_archive::RpfFile;
@@ -119,24 +143,41 @@ let file = RpfFile::open("update.rpf".as_ref(), None)?;
 let tree = build_directory_tree(&file.archive);
 ```
 
+## Where things live
+
+```
+src/
+  archive.rs    parsing every archive version's table of contents; entry kinds; extraction
+  crypto/       AES and NG ciphers, key loading
+  writer.rs     RpfBuilder, and rage_joaat for entry name hashes
+  tree.rs       directory tree over a parsed archive
+  dlc.rs        dlclist.xml / setup2.xml load order
+  tests.rs      write-then-read round trips for every version
+```
+
 ## Changes in 0.10.0
 
 The crate is archives only again. Everything that parsed or drew what is
-*inside* an archive moved out:
+*inside* an archive moved out, with its git history:
 
-- `rage-formats` — RSC7 resources: textures (`.ytd`), drawables (`.ydr`/
-  `.ydd`), fragments (`.yft`), `.ymt`/`.ytyp` meta, `gtxd` relationships,
-  `texture_utils`, `math`, `vertex`, `rage_joaat`.
-- `rage-render` — the CPU rasteriser, contact sheets, bitmap font and the
+- `rage-formats`: RSC7 resources (textures, drawables, fragments, meta,
+  gtxd), `texture_utils`, `math`, `vertex`, `rage_joaat`; since then also
+  `ybn`, `ynv` (read and write), `ymap` and a full `ytyp` parser.
+- `rage-render`: the CPU rasteriser, contact sheets, bitmap font and the
   wasm glTF export.
 
 `rpf-archive` keeps reading and writing RPF/IMG archives, the crypto, the
-directory tree and the DLC list parsers. `RSC7_MAGIC`,
+directory tree and the DLC list parsers, and drops the `image`, `gltf`,
+`texture2ddecoder`, `json` and `wasm-bindgen` dependencies. `RSC7_MAGIC`,
 `resource_size_from_flags` and `resource_version_from_flags` are still
 exported here (an archive needs them for entry sizes); `rage-formats`
-exports the same values.
+exports the same values. Callers that imported parsers from this crate
+import them from `rage-formats` now.
 
-## Changes in 0.9.1
+## Earlier changes
+
+<details>
+<summary>0.9.1</summary>
 
 - `Drawable::diffuse_texture_name` falls back to the `TextureSampler`
   parameter (`TEXTURE_SAMPLER`), so drawables converted from the GTA IV /
@@ -153,7 +194,10 @@ exports the same values.
 - Back-face culling was checked against retail drawables: counter-clockwise
   front faces are the ones kept, on mirrored wheels too.
 
-## Changes in 0.9.0
+</details>
+
+<details>
+<summary>0.9.0</summary>
 
 - `Fragment` now carries its physics children (`children`) and default bone
   pose (`bone_transforms`); `Fragment::render_parts` lists the body and every
@@ -166,13 +210,19 @@ exports the same values.
 - Breaking: `Fragment` has two new public fields, so code constructing it by
   hand must set them.
 
-## Changes in 0.8.1
+</details>
+
+<details>
+<summary>0.8.1</summary>
 
 - The renderer picks alpha handling from the shader's render bucket instead of
   alpha-testing any texture that has a translucent pixel. Translucent
   materials (ziplock bags, glass, decals) now blend instead of vanishing.
 
-## Breaking changes in 0.8.0
+</details>
+
+<details>
+<summary>0.8.0 (breaking)</summary>
 
 - `parse_ydd` now returns `Vec<DrawableEntry>` instead of a bare list of
   `Drawable`s, so every entry carries its resolved hash and unique name
@@ -185,6 +235,8 @@ exports the same values.
 - New shader-parameter hash constants: `DIFFUSE_SAMPLER`, `BUMP_SAMPLER`,
   `SPEC_SAMPLER`.
 
+</details>
+
 ## License
 
-This project is released under the [Unlicense](LICENSE) — public domain.
+This project is released under the [Unlicense](LICENSE), public domain.
