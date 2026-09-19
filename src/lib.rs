@@ -16,6 +16,7 @@ pub mod sheet;
 pub mod render;
 pub mod ytyp;
 pub mod gtxd;
+pub mod dlc;
 mod rbf;
 mod tests;
 
@@ -38,6 +39,7 @@ pub use wasm::convert_to_gltf;
 pub use ymt::{parse_ymt, PedVariationInfo};
 pub use ytyp::{parse_archetype_txds, ArchetypeTxd};
 pub use gtxd::{parse_txd_relationships, TxdRelationship};
+pub use dlc::{parse_dlc_list, parse_dlc_setup_order};
 pub use math::{Vec2, Vec3, Vec4, Mat4};
 pub use resource::{SYSTEM_BASE, GRAPHICS_BASE};
 pub use font::{draw_text, text_width, FONT_5X7, GLYPH_H, GLYPH_W};
