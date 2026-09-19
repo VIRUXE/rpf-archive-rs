@@ -23,7 +23,7 @@ Add to `Cargo.toml`:
 
 ```toml
 [dependencies]
-rpf-archive = "0.8"
+rpf-archive = "0.10"
 ```
 
 ### Reading an RPF archive (RPF2–RPF7)
@@ -119,102 +119,22 @@ let file = RpfFile::open("update.rpf".as_ref(), None)?;
 let tree = build_directory_tree(&file.archive);
 ```
 
-### Drawables
+## Changes in 0.10.0
 
-`parse_drawables` reads any drawable-bearing resource — a lone `.ydr`, a
-`.ydd` dictionary, or a `.yft` fragment — into one flat list of named
-entries, letting the caller stay agnostic about which of the three it was
-handed:
+The crate is archives only again. Everything that parsed or drew what is
+*inside* an archive moved out:
 
-```rust
-use rpf_archive::{parse_drawables, DrawableKind};
+- `rage-formats` — RSC7 resources: textures (`.ytd`), drawables (`.ydr`/
+  `.ydd`), fragments (`.yft`), `.ymt`/`.ytyp` meta, `gtxd` relationships,
+  `texture_utils`, `math`, `vertex`, `rage_joaat`.
+- `rage-render` — the CPU rasteriser, contact sheets, bitmap font and the
+  wasm glTF export.
 
-let entries = parse_drawables(&ydd_bytes, DrawableKind::Ydd)?;
-for entry in &entries {
-    println!("{} (0x{:08X}): {} triangle(s)", entry.name, entry.hash, entry.drawable.geometry_count());
-}
-```
-
-Each `DrawableEntry { hash, name, drawable }` carries a `Drawable` — bounds,
-LODs, shader group and geometry. Entries that would otherwise share a name
-(dictionary members with no name of their own, or a fragment's extra
-drawables with no names array) are automatically given unique `0x…` names
-instead of overwriting each other.
-
-### Textures to images
-
-`.ytd` textures decode straight to an `image::RgbaImage`, ready to resize and
-encode:
-
-```rust
-use rpf_archive::{parse_ytd, texture_utils::{to_rgba_image, fit_max_size, encode_image, ImageFormat}};
-
-let textures = parse_ytd(&ytd_bytes)?;
-for texture in &textures {
-    let image = to_rgba_image(texture)?;
-    let image = fit_max_size(image, 512);
-    let png_bytes = encode_image(&image, ImageFormat::Png, 90)?;
-    std::fs::write(format!("{}.png", texture.name), png_bytes)?;
-}
-```
-
-### Rendering
-
-A small CPU rasterizer (no GPU, runs under wasm) turns a parsed `Drawable`
-into a preview image from one of six fixed camera angles:
-
-```rust
-use rpf_archive::{render_views, RenderOptions, TextureSet, View};
-
-let mut textures = TextureSet::new();
-textures.push_layer(&embedded_textures); // e.g. from the drawable's own shader group
-textures.push_layer(&shared_textures);   // lower-priority fallback layer
-
-// `paint` tints geometries drawn with a vehicle_paint*.sps shader: the YFT
-// carries no body colour, the game applies it at runtime from carcols.
-let options = RenderOptions { view: View::Iso, paint: Some([200, 30, 30]), ..Default::default() };
-let rendered = render_views(&drawable, &textures, &options, &View::ALL)?;
-for (view, image, report) in rendered {
-    println!("{view}: {} triangle(s), {} missing texture(s)", report.triangles, report.missing_textures.len());
-    image.save(format!("{view}.png"))?;
-}
-```
-
-`render_drawable` is the single-view shorthand when only `options.view`
-matters.
-
-A fragment is more than its main drawable: wheels, doors and other physics
-children are drawables of their own, each placed on the body by a transform.
-`Fragment::render_parts` lists them (filling empty wheel slots from the
-front/rear wheel mesh and mirroring right-hand wheels, as CodeWalker does)
-and `render_parts` frames them together:
-
-```rust
-use rpf_archive::{parse_yft, render_parts, RenderOptions, RenderPart, TextureSet, View};
-
-let fragment = parse_yft(&yft_bytes)?;
-let parts: Vec<RenderPart<'_>> = fragment.render_parts().into_iter().map(RenderPart::from).collect();
-let rendered = render_parts(&parts, &textures, &RenderOptions::default(), &[View::Iso])?;
-```
-
-A `RenderPart` carries the drawable, a transform applied to all of its models
-and an optional per-bone pose selected by each model's bone index, so any
-composite of drawables can be rendered the same way.
-
-Each geometry is drawn the way its shader's RAGE render bucket says: bucket 0
-is opaque and ignores alpha, bucket 3 (`cutout`, foliage, fences) is
-alpha-tested at half, and buckets 1 and 2 (`*_alpha`, `decal`) are blended
-over what is already drawn, after all solid geometry, back to front, without
-writing depth. Blending over a transparent background keeps the coverage in
-the output alpha.
-
-One line each on two smaller pieces the renderer and CLI build on:
-- **Contact sheet**: `compose_sheet`/`sheet_layout` lay out a grid of
-  labelled thumbnails (e.g. one render per view, or a batch of extracted
-  textures) into a single `RgbaImage`.
-- **Bitmap font**: `draw_text`/`text_width` (backed by the `FONT_5X7` glyph
-  table) draw simple pixel labels directly onto an `RgbaImage`, with no font
-  file or text-shaping dependency.
+`rpf-archive` keeps reading and writing RPF/IMG archives, the crypto, the
+directory tree and the DLC list parsers. `RSC7_MAGIC`,
+`resource_size_from_flags` and `resource_version_from_flags` are still
+exported here (an archive needs them for entry sizes); `rage-formats`
+exports the same values.
 
 ## Changes in 0.9.1
 

@@ -1,15 +1,12 @@
 [package]
 name = "rpf-archive"
-version = "0.9.4"
+version = "0.10.0"
 edition = "2021"
 description = "Rockstar Package File (RPF) archive library — read and write RPF0–RPF8, IMG1, IMG2, and IMG3 across GTA, RDR, and related titles"
 license = "Unlicense"
 repository = "https://github.com/VIRUXE/rpf-archive-rs"
 keywords = ["rpf", "gta", "rdr", "rockstar", "archive"]
 categories = ["parsing", "game-development"]
-
-[lib]
-crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 anyhow = "1.0"
@@ -19,10 +16,4 @@ cipher = "0.4"
 sha1 = "0.10"
 ruzstd = "0.8"
 lzxd = "0.2"
-wasm-bindgen = "0.2"
-console_error_panic_hook = "0.1"
-gltf = { version = "1.4", default-features = false, features = ["utils", "names"] }
-image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
-texture2ddecoder = "0.1"
-json = "0.12"
 roxmltree = "0.20"
