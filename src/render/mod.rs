@@ -3,6 +3,7 @@
 //! it also runs under wasm.
 
 mod camera;
+mod cluster;
 mod mesh;
 mod raster;
 mod textures;
@@ -10,8 +11,8 @@ mod textures;
 use anyhow::Result;
 use image::RgbaImage;
 
-use crate::math::{Mat4, Vec3};
-use crate::ydd::{Drawable, DrawableBounds, LodLevel};
+use crate::math::Mat4;
+use crate::ydd::{Drawable, LodLevel};
 use raster::Framebuffer;
 
 pub use textures::TextureSet;
@@ -86,6 +87,11 @@ pub struct RenderOptions {
     /// geometry drawn with a `vehicle_paint*.sps` shader. The game applies
     /// paint at runtime from carcols metadata, so the YFT itself has none.
     pub paint: Option<[u8; 3]>,
+    /// Frame the camera on the island of geometry carrying the bulk of the
+    /// triangles when a drawable is really several pieces scattered far
+    /// apart (rpf-cli#4), instead of the pieces' shared bounding box. Stray
+    /// islands are still drawn — they simply fall outside the frame.
+    pub cluster_framing: bool,
 }
 
 /// JOAAT hashes of the `vehicle_paint*.sps` shader files (CodeWalker's
@@ -115,6 +121,7 @@ impl Default for RenderOptions {
             fov_deg: 40.0,
             margin: 1.1,
             paint: None,
+            cluster_framing: true,
         }
     }
 }
@@ -139,6 +146,13 @@ pub struct RenderReport {
     /// rebuilt from the vertices.
     pub bounds_computed: bool,
     pub lod: Option<LodLevel>,
+    /// Spatial islands the drawn geometry fell into. 1 for a normal model, 0
+    /// when nothing was drawn.
+    pub framing_islands: usize,
+    /// Geometries left outside the frame because the camera was fitted to
+    /// one island instead of their shared bounds. Zero whenever framing was
+    /// left alone, so a batch diff only moves on an actual behaviour change.
+    pub framing_excluded_geometries: usize,
 }
 
 /// One drawable in a composite render, with where to put it.
@@ -198,6 +212,16 @@ pub fn render_views(
 /// A single unmoved part keeps its drawable's stored bounds when they are
 /// sound (see `Drawable::bounds_or_computed`); anything else is framed by
 /// the bounds of the placed vertices, and the report says so.
+///
+/// Either way, when `o.cluster_framing` is set (the default) that result is
+/// then handed to `cluster::framing_override`, which frames the spatial
+/// island carrying the bulk of the geometry instead when the drawable is
+/// really several pieces scattered far apart (rpf-cli#4) — clustering only
+/// ever looks at drawn vertices, never at `drawable.bounds`, so it cannot
+/// undo the protection `bounds_or_computed` gives skinned/ped drawables: for
+/// those, the stored bounds are already replaced by vertex bounds before
+/// clustering runs, and their geometries sit close together so nothing
+/// changes. Stray islands are still drawn, just left out of the frame.
 pub fn render_parts(
     parts: &[RenderPart<'_>],
     tex: &TextureSet,
@@ -233,9 +257,24 @@ pub fn render_parts(
         geometries.extend(mesh::prepare(d, lod, &part.transform, part.bone_transforms, tex, o.paint, &mut report));
     }
 
+    let boxes = cluster::geometry_boxes(&geometries);
+
     if !single_unmoved && !geometries.is_empty() {
         report.bounds_computed = true;
-        bounds = Some(bounds_of(&geometries));
+        bounds = Some(cluster::union_bounds(&boxes));
+    }
+
+    if let Some(current) = &bounds {
+        if o.cluster_framing {
+            let (islands, override_) = cluster::framing_override(&boxes, current);
+            report.framing_islands = islands;
+            if let Some((framed, excluded)) = override_ {
+                report.framing_excluded_geometries = excluded;
+                bounds = Some(framed);
+            }
+        } else {
+            report.framing_islands = cluster::islands(&boxes).len();
+        }
     }
 
     report.missing_textures.sort();
@@ -293,30 +332,6 @@ pub fn render_parts(
     Ok(out)
 }
 
-/// Axis-aligned bounds of every finite vertex across the prepared geometry.
-fn bounds_of(geometries: &[mesh::PreparedGeometry<'_>]) -> DrawableBounds {
-    let mut min = Vec3::new(f32::INFINITY, f32::INFINITY, f32::INFINITY);
-    let mut max = Vec3::new(f32::NEG_INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY);
-
-    for vertex in geometries.iter().flat_map(|geometry| &geometry.verts) {
-        let p = vertex.position;
-        if p.x.is_finite() && p.y.is_finite() && p.z.is_finite() {
-            min = min.min(p);
-            max = max.max(p);
-        }
-    }
-
-    if min.x > max.x {
-        return DrawableBounds { center: Vec3::ZERO, sphere_radius: 0.0, box_min: Vec3::ZERO, box_max: Vec3::ZERO };
-    }
-
-    DrawableBounds {
-        center: (min + max) * 0.5,
-        sphere_radius: (max - min).length() * 0.5,
-        box_min: min,
-        box_max: max,
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -500,9 +515,10 @@ mod tests {
         vec![0, 1, 2, 0, 2, 3]
     }
 
-    /// An axis-aligned box centred on the origin, with per-face outward
-    /// normals. `half_extents` of 0.5 on every axis gives the unit cube.
-    fn box_drawable(half_extents: Vec3) -> Drawable {
+    /// An axis-aligned box's vertices and indices, per-face outward normals,
+    /// centred at `center`. `half_extents` of 0.5 on every axis gives a box
+    /// centred on the origin with a unit-cube shape.
+    fn box_vertices(center: Vec3, half_extents: Vec3) -> (Vec<FixtureVertex>, Vec<u32>) {
         let faces: [(Vec3, Vec3, Vec3); 6] = [
             // (normal, u axis, v axis)
             (Vec3::new(0.0, -1.0, 0.0), Vec3::X, Vec3::Z),
@@ -535,14 +551,44 @@ mod tests {
                     corner.x * half_extents.x * 2.0,
                     corner.y * half_extents.y * 2.0,
                     corner.z * half_extents.z * 2.0,
-                );
+                ) + center;
                 vertices.push((scaled, normal, uv, [200, 180, 160, 255]));
             }
             indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
         }
 
+        (vertices, indices)
+    }
+
+    /// An axis-aligned box centred on the origin, with per-face outward
+    /// normals. `half_extents` of 0.5 on every axis gives the unit cube.
+    fn box_drawable(half_extents: Vec3) -> Drawable {
+        let (vertices, indices) = box_vertices(Vec3::ZERO, half_extents);
         let geometries = vec![geometry(&vertices, indices, 0)];
         drawable(geometries, shader_group(None))
+    }
+
+    /// A drawable with two small cube geometries far apart from each other —
+    /// the shape of `hei_bank_heist_card` (rpf-cli#4): one at the origin,
+    /// one at `far`, each a cube of `half_extent` on every axis. Stored
+    /// bounds are set to the honest union of both so `bounds_or_computed`
+    /// accepts them unchanged.
+    fn two_cubes_drawable(far: Vec3, half_extent: f32) -> Drawable {
+        let he = Vec3::new(half_extent, half_extent, half_extent);
+        let (v0, i0) = box_vertices(Vec3::ZERO, he);
+        let (v1, i1) = box_vertices(far, he);
+        let geometries = vec![geometry(&v0, i0, 0), geometry(&v1, i1, 0)];
+        let mut d = drawable(geometries, shader_group(None));
+
+        let min = (Vec3::ZERO - he).min(far - he);
+        let max = (Vec3::ZERO + he).max(far + he);
+        d.bounds = DrawableBounds {
+            center: (min + max) * 0.5,
+            sphere_radius: (max - min).length() * 0.5,
+            box_min: min,
+            box_max: max,
+        };
+        d
     }
 
     fn options(width: u32, height: u32) -> RenderOptions {
@@ -718,6 +764,8 @@ mod tests {
 
         assert_eq!(report.triangles, 4);
         assert!(report.bounds_computed, "composite bounds come from the placed vertices");
+        assert_eq!(report.framing_islands, 1, "the gap is smaller than either quad, so they stay one island");
+        assert_eq!(report.framing_excluded_geometries, 0);
         let ratio = silhouette_ratio(image, options.background);
         assert!((ratio - 2.5).abs() < 0.15, "silhouette ratio {ratio} != 2.5");
     }
@@ -764,6 +812,69 @@ mod tests {
         };
         let (_, report) = render_drawable(&cube, &TextureSet::new(), &options(32, 32)).unwrap();
         assert!(!report.bounds_computed);
+        assert_eq!(report.framing_islands, 1);
+        assert_eq!(report.framing_excluded_geometries, 0);
+    }
+
+    /// The reproducer for rpf-cli#4: a drawable authored as two small pieces
+    /// scattered metres apart frames on the piece with the bulk of the
+    /// geometry, not the pieces' shared (and honestly reported) bounds.
+    #[test]
+    fn two_far_islands_frame_the_kept_one() {
+        let cube = two_cubes_drawable(Vec3::new(4.0, 4.0, 0.0), 0.04);
+        let (image, report) =
+            render_drawable(&cube, &TextureSet::new(), &options(256, 256)).unwrap();
+
+        assert!(!report.bounds_computed, "stored bounds honestly describe the union and are accepted");
+        assert_eq!(report.framing_islands, 2);
+        assert_eq!(report.framing_excluded_geometries, 1);
+
+        // Pre-fix this silhouette is a handful of pixels; post-fix the kept
+        // cube should occupy a healthy fraction of a 256px frame.
+        let mut min = (u32::MAX, u32::MAX);
+        let mut max = (0u32, 0u32);
+        for (x, y, pixel) in image.enumerate_pixels() {
+            if pixel.0 != options(256, 256).background {
+                min = (min.0.min(x), min.1.min(y));
+                max = (max.0.max(x), max.1.max(y));
+            }
+        }
+        let width = (max.0 - min.0 + 1) as f32;
+        assert!(width / 256.0 > 0.6, "kept cube should fill most of the frame, spanned {width}px");
+    }
+
+    /// The excluded island is a framing decision only — it is still prepared
+    /// and submitted to the rasterizer.
+    #[test]
+    fn the_excluded_island_is_still_drawn() {
+        let cube = two_cubes_drawable(Vec3::new(4.0, 4.0, 0.0), 0.04);
+        let (_, report) = render_drawable(&cube, &TextureSet::new(), &options(256, 256)).unwrap();
+        assert_eq!(report.geometries, 2);
+        assert_eq!(report.triangles, 24);
+    }
+
+    /// The 127-prop regression guard in unit form: two normally-jointed
+    /// pieces (gap smaller than either) must not be split or reframed.
+    #[test]
+    fn nearby_geometries_keep_the_stored_bounds() {
+        let cube = two_cubes_drawable(Vec3::new(1.5, 0.0, 0.0), 0.5);
+        let opts = RenderOptions { view: View::Front, ..options(200, 200) };
+        let (image, report) = render_drawable(&cube, &TextureSet::new(), &opts).unwrap();
+
+        assert_eq!(report.framing_islands, 1);
+        assert_eq!(report.framing_excluded_geometries, 0);
+        assert!(!report.bounds_computed);
+
+        let ratio = silhouette_ratio(&image, opts.background);
+        assert!((ratio - 2.5).abs() < 0.2, "both cubes should be visible, ratio {ratio}");
+    }
+
+    #[test]
+    fn cluster_framing_can_be_turned_off() {
+        let cube = two_cubes_drawable(Vec3::new(4.0, 4.0, 0.0), 0.04);
+        let opts = RenderOptions { cluster_framing: false, ..options(256, 256) };
+        let (_, report) = render_drawable(&cube, &TextureSet::new(), &opts).unwrap();
+        assert_eq!(report.framing_excluded_geometries, 0, "clustering is disabled, framing must not change");
     }
 
     #[test]

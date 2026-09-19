@@ -75,6 +75,22 @@ pub struct DrawableBounds {
     pub box_max: Vec3,
 }
 
+/// One geometry's own vertex extent — what [`Drawable::bounds_or_computed`]
+/// folds away into a single box. See [`Drawable::geometry_bounds`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct GeometryBounds {
+    pub model: usize,
+    pub geometry: usize,
+    pub shader_id: u16,
+    pub vertices: usize,
+    pub triangles: usize,
+    pub min: Vec3,
+    pub max: Vec3,
+    /// Mean of the finite vertex positions — not the box centre; the two
+    /// disagreeing says where the mesh's mass actually sits.
+    pub centroid: Vec3,
+}
+
 #[derive(Debug, Clone)]
 pub struct ShaderGroup {
     pub textures: Vec<YtdTexture>,
@@ -831,6 +847,69 @@ impl Drawable {
         )
     }
 
+    /// Per-geometry vertex bounds for `lod`, in model then geometry order.
+    ///
+    /// `bounds_or_computed` folds every geometry's vertices into one box; this
+    /// keeps them separate, which is what actually shows a drawable authored
+    /// as several pieces scattered far apart (see `render::cluster`) instead
+    /// of one compact mesh. Geometries with no decodable vertex buffer, or
+    /// with no finite vertex, are skipped.
+    pub fn geometry_bounds(&self, lod: &DrawableLod) -> Vec<GeometryBounds> {
+        let mut out = Vec::new();
+
+        for (model_index, model) in lod.models.iter().enumerate() {
+            for (geometry_index, geometry) in model.geometries.iter().enumerate() {
+                let Some(buffer) = &geometry.vertex_buffer else { continue };
+                let Ok(vertices) = buffer.to_unified_vertices() else { continue };
+
+                let mut min = Vec3::new(f32::INFINITY, f32::INFINITY, f32::INFINITY);
+                let mut max = Vec3::new(f32::NEG_INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY);
+                let mut sum = (0.0f64, 0.0f64, 0.0f64);
+                let mut seen = 0usize;
+
+                for vertex in &vertices {
+                    let p = vertex.position;
+                    if !p.x.is_finite() || !p.y.is_finite() || !p.z.is_finite() {
+                        continue;
+                    }
+                    min = min.min(p);
+                    max = max.max(p);
+                    sum.0 += p.x as f64;
+                    sum.1 += p.y as f64;
+                    sum.2 += p.z as f64;
+                    seen += 1;
+                }
+
+                if seen == 0 {
+                    continue;
+                }
+
+                let triangles = if geometry.indices_count > 0 {
+                    geometry.indices_count as usize / 3
+                } else {
+                    geometry.index_buffer.as_ref().map(|ib| ib.indices.len()).unwrap_or(0) / 3
+                };
+
+                out.push(GeometryBounds {
+                    model: model_index,
+                    geometry: geometry_index,
+                    shader_id: geometry.shader_id,
+                    vertices: seen,
+                    triangles,
+                    min,
+                    max,
+                    centroid: Vec3::new(
+                        (sum.0 / seen as f64) as f32,
+                        (sum.1 / seen as f64) as f32,
+                        (sum.2 / seen as f64) as f32,
+                    ),
+                });
+            }
+        }
+
+        out
+    }
+
     /// Total triangles across a LOD, derived from the geometries' index counts.
     pub fn triangle_count(&self, lod: &DrawableLod) -> usize {
         lod.models
@@ -1394,6 +1473,98 @@ pub(crate) mod tests {
         assert_eq!(DrawableKind::from_extension("Ydd"), Some(DrawableKind::Ydd));
         assert_eq!(DrawableKind::from_extension(".yft"), Some(DrawableKind::Yft));
         assert_eq!(DrawableKind::from_extension("ytd"), None);
+    }
+
+    /// A geometry with a position-only vertex buffer at `positions`, no
+    /// declaration (so `to_unified_vertices` falls back to raw Float3s),
+    /// and one triangle if there are at least 3 vertices.
+    fn position_geometry(shader_id: u16, positions: &[Vec3]) -> DrawableGeometry {
+        let mut data = Vec::with_capacity(positions.len() * 12);
+        for p in positions {
+            data.extend_from_slice(&p.x.to_le_bytes());
+            data.extend_from_slice(&p.y.to_le_bytes());
+            data.extend_from_slice(&p.z.to_le_bytes());
+        }
+        let indices: Vec<u32> = if positions.len() >= 3 { vec![0, 1, 2] } else { Vec::new() };
+        DrawableGeometry {
+            shader_id,
+            indices_count: indices.len() as u32,
+            triangles_count: (indices.len() / 3) as u32,
+            vertices_count: positions.len() as u16,
+            vertex_stride: 12,
+            vertex_buffer: Some(VertexBuffer {
+                vertex_stride: 12,
+                vertex_count: positions.len() as u32,
+                data_pointer: 0,
+                info_pointer: 0,
+                declaration: None,
+                data,
+                layout: VertexBufferLayout::Legacy,
+            }),
+            index_buffer: Some(IndexBuffer {
+                indices_count: indices.len() as u32,
+                indices_pointer: 0,
+                indices,
+            }),
+        }
+    }
+
+    /// Per-geometry bounds are reported separately even when the drawable's
+    /// stored bounds fold them into one box — this is what lets rpf-cli#4's
+    /// two-piece shape be measured directly.
+    #[test]
+    fn geometry_bounds_reports_each_geometry_separately() {
+        let mut d = stub_drawable("two_geometries");
+        d.lods.push(DrawableLod {
+            level: LodLevel::High,
+            models: vec![DrawableModel {
+                skeleton_binding: 0,
+                render_mask_flags: 0,
+                shader_mapping: vec![0, 1],
+                geometries: vec![
+                    position_geometry(0, &[
+                        Vec3::new(0.0, 0.0, 0.0),
+                        Vec3::new(1.0, 0.0, 0.0),
+                        Vec3::new(0.0, 1.0, 0.0),
+                    ]),
+                    position_geometry(1, &[
+                        Vec3::new(10.0, 10.0, 10.0),
+                        Vec3::new(11.0, 10.0, 10.0),
+                        Vec3::new(10.0, 11.0, 10.0),
+                    ]),
+                    // No vertex buffer: must be skipped, not panic.
+                    DrawableGeometry {
+                        shader_id: 0,
+                        indices_count: 0,
+                        triangles_count: 0,
+                        vertices_count: 0,
+                        vertex_stride: 0,
+                        vertex_buffer: None,
+                        index_buffer: None,
+                    },
+                ],
+            }],
+        });
+
+        let lod = &d.lods[0];
+        let geoms = d.geometry_bounds(lod);
+
+        assert_eq!(geoms.len(), 2, "the geometry with no vertex buffer is skipped");
+
+        assert_eq!(geoms[0].model, 0);
+        assert_eq!(geoms[0].geometry, 0);
+        assert_eq!(geoms[0].shader_id, 0);
+        assert_eq!(geoms[0].vertices, 3);
+        assert_eq!(geoms[0].triangles, 1);
+        assert_eq!(geoms[0].min, Vec3::new(0.0, 0.0, 0.0));
+        assert_eq!(geoms[0].max, Vec3::new(1.0, 1.0, 0.0));
+        let c0 = geoms[0].centroid;
+        assert!((c0.x - 1.0 / 3.0).abs() < 1e-5 && (c0.y - 1.0 / 3.0).abs() < 1e-5 && c0.z == 0.0);
+
+        assert_eq!(geoms[1].geometry, 1);
+        assert_eq!(geoms[1].shader_id, 1);
+        assert_eq!(geoms[1].min, Vec3::new(10.0, 10.0, 10.0));
+        assert_eq!(geoms[1].max, Vec3::new(11.0, 11.0, 10.0));
     }
 
     #[test]
