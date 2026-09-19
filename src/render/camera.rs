@@ -7,6 +7,19 @@ use crate::ydd::DrawableBounds;
 /// Direction the light travels *toward* — i.e. the vector used in `dot(n, l)`.
 const LIGHT_DIR: Vec3 = Vec3 { x: 0.4, y: -0.6, z: 0.8 };
 
+/// The radius the camera fits into the frame: the stored sphere radius, or
+/// the box half-diagonal when that is larger, never below 1e-3. Shared with
+/// `render::cluster`'s shrink guard so the two agree by construction.
+pub(crate) fn fit_radius(bounds: &DrawableBounds) -> f32 {
+    let half_diagonal = (bounds.box_max - bounds.box_min).length() * 0.5;
+    let radius = bounds.sphere_radius.max(half_diagonal).max(1e-3);
+    if radius.is_finite() {
+        radius
+    } else {
+        1.0
+    }
+}
+
 /// Builds the view-projection matrix that frames `bounds` from `view`.
 ///
 /// The world is Z-up with +Y forward. Returns the combined matrix, the eye
@@ -23,11 +36,7 @@ pub(crate) fn camera_for(
     let fov = fov_deg.clamp(1.0, 170.0).to_radians();
 
     let center = bounds.center;
-    let half_diagonal = (bounds.box_max - bounds.box_min).length() * 0.5;
-    let mut radius = bounds.sphere_radius.max(half_diagonal).max(1e-3);
-    if !radius.is_finite() {
-        radius = 1.0;
-    }
+    let radius = fit_radius(bounds);
 
     let mut distance = radius / (fov * 0.5).sin() * margin;
     if aspect < 1.0 {
@@ -192,5 +201,38 @@ mod tests {
         assert!(view_proj.0.iter().all(|v| v.is_finite()));
         assert!(eye.length().is_finite() && eye.length() > 0.0);
         assert!((light.length() - 1.0).abs() < 1e-5);
+    }
+
+    /// `fit_radius` is what `camera_for` actually puts into the distance
+    /// formula; pin the extraction against both branches of the max().
+    #[test]
+    fn fit_radius_matches_the_distance_the_camera_uses() {
+        let sphere_dominant = DrawableBounds {
+            center: Vec3::ZERO,
+            sphere_radius: 5.0,
+            box_min: Vec3::new(-1.0, -1.0, -1.0),
+            box_max: Vec3::new(1.0, 1.0, 1.0),
+        };
+        assert!((fit_radius(&sphere_dominant) - 5.0).abs() < 1e-5);
+
+        let box_dominant = DrawableBounds {
+            center: Vec3::ZERO,
+            sphere_radius: 0.1,
+            box_min: Vec3::new(-2.0, -2.0, -2.0),
+            box_max: Vec3::new(2.0, 2.0, 2.0),
+        };
+        let expected_half_diagonal = (Vec3::new(4.0, 4.0, 4.0).length()) * 0.5;
+        assert!((fit_radius(&box_dominant) - expected_half_diagonal).abs() < 1e-4);
+
+        for bounds in [&sphere_dominant, &box_dominant] {
+            let fov_deg = 40.0f32;
+            let margin = 1.1f32;
+            let (_, eye, _) = camera_for(bounds, View::Front, 1.0, fov_deg, margin);
+            let expected_distance = fit_radius(bounds) / (fov_deg.to_radians() * 0.5).sin() * margin;
+            assert!(
+                (eye.length() - expected_distance).abs() < 1e-3,
+                "distance {} != {expected_distance}", eye.length()
+            );
+        }
     }
 }

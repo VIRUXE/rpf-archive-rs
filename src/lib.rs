@@ -29,11 +29,11 @@ pub use tree::{DirNode, FileRef, build_directory_tree, list_all_files};
 pub use writer::{RpfBuilder, rage_joaat};
 pub use ytd::{parse_ytd, TextureFormat, YtdTexture};
 pub use ydd::{parse_ydd, parse_ydr, parse_drawables, Drawable, DrawableBounds, DrawableEntry,
-              DrawableGeometry, DrawableKind, DrawableLod, DrawableModel, IndexBuffer, LodLevel,
-              ShaderFx, ShaderGroup, ShaderParameter, ShaderParameterValue, UnifiedVertex,
-              VertexAttribute, VertexAttributeValue, VertexBuffer, VertexBufferLayout,
-              VertexComponent, VertexComponentType, VertexDeclaration, VertexSemantic,
-              BUMP_SAMPLER, DIFFUSE_SAMPLER, SPEC_SAMPLER, TEXTURE_SAMPLER};
+              DrawableGeometry, DrawableKind, DrawableLod, DrawableModel, GeometryBounds,
+              IndexBuffer, LodLevel, ShaderFx, ShaderGroup, ShaderParameter, ShaderParameterValue,
+              UnifiedVertex, VertexAttribute, VertexAttributeValue, VertexBuffer,
+              VertexBufferLayout, VertexComponent, VertexComponentType, VertexDeclaration,
+              VertexSemantic, BUMP_SAMPLER, DIFFUSE_SAMPLER, SPEC_SAMPLER, TEXTURE_SAMPLER};
 pub use yft::{parse_yft, wheel_slot, Fragment, FragmentChild, FragmentPart, WheelSlot};
 pub use wasm::convert_to_gltf;
 pub use ymt::{parse_ymt, PedVariationInfo};
