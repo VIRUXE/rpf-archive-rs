@@ -40,6 +40,7 @@ pub use ytyp::{parse_archetype_txds, ArchetypeTxd};
 pub use gtxd::{parse_txd_relationships, TxdRelationship};
 pub use math::{Vec2, Vec3, Vec4, Mat4};
 pub use resource::{SYSTEM_BASE, GRAPHICS_BASE};
+pub use vertex::{parse_gen9_declaration, G9_DECLARATION_SIZE, G9_FORMAT_COUNT};
 pub use font::{draw_text, text_width, FONT_5X7, GLYPH_H, GLYPH_W};
 pub use render::{is_vehicle_paint_shader, render_drawable, render_parts, render_views, RenderOptions,
                  RenderPart, RenderReport, TextureSet, View, VEHICLE_PAINT_SPS};

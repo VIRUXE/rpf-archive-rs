@@ -212,6 +212,7 @@ mod tests {
                 declaration: Some(declaration),
                 data,
                 layout: VertexBufferLayout::Legacy,
+                g9_formats: [0; crate::vertex::G9_FORMAT_COUNT],
             }),
             index_buffer: Some(IndexBuffer { indices_count: 3, indices_pointer: 0, indices: vec![0, 1, 2] }),
         };

@@ -10,6 +10,10 @@ use anyhow::{Context, Result};
 use crate::math::{Vec2, Vec3, Vec4};
 use crate::resource::{f32_le, u16_le, u32_le, u64_le, vec3_le, vec4_le, ResReader};
 
+#[path = "vertex_gen9.rs"]
+mod gen9;
+pub use gen9::parse_gen9_declaration;
+
 // ─── Vertex model ─────────────────────────────────────────────────────────────
 
 /// Which of the several vertex buffer layouts a geometry's vertices came from.
@@ -19,11 +23,15 @@ pub enum VertexBufferLayout {
     Legacy,
     /// Legacy layout whose usable stream lives in `DataPointer2` instead.
     LegacyData2,
-    /// Gen9 layout — no vertex declaration is stored.
+    /// Gen9 layout. The 320-byte `VertexDeclarationG9` lives at `info_pointer`
+    /// and original element formats are kept in [`VertexBuffer::g9_formats`].
     Gen9,
     /// No vertex buffer struct: the geometry carries the stream itself.
     GeometryInline,
 }
+
+pub const G9_FORMAT_COUNT: usize = 52;
+pub const G9_DECLARATION_SIZE: usize = 320;
 
 #[derive(Debug, Clone)]
 pub struct VertexBuffer {
@@ -34,6 +42,9 @@ pub struct VertexBuffer {
     pub declaration: Option<VertexDeclaration>,
     pub data: Vec<u8>,
     pub layout: VertexBufferLayout,
+    /// Original Gen9 element-format IDs (52 slots). All zeros when the buffer
+    /// is not Gen9 or no G9 declaration was found.
+    pub g9_formats: [u8; G9_FORMAT_COUNT],
 }
 
 #[derive(Debug, Clone)]
@@ -156,6 +167,7 @@ pub(crate) fn parse_vertex_buffer_at(
                 declaration: parse_vertex_declaration_at(reader, info_pointer),
                 data,
                 layout: VertexBufferLayout::Legacy,
+                g9_formats: [0; G9_FORMAT_COUNT],
             });
         }
 
@@ -170,24 +182,38 @@ pub(crate) fn parse_vertex_buffer_at(
                 declaration: parse_vertex_declaration_at(reader, info_pointer),
                 data,
                 layout: VertexBufferLayout::LegacyData2,
+                g9_formats: [0; G9_FORMAT_COUNT],
             });
         }
 
-        // 3. Gen9 — count and stride swap places and no declaration is stored.
+        // 3. Gen9 — count/stride swap places; the 320-byte declaration sits at 0x38.
         let gen9_count = u32_le(raw, 0x08);
         let gen9_stride = u16_le(raw, 0x0C);
         let gen9_pointer = u64_le(raw, 0x18);
-        if let Some(data) = read_vertex_data(reader, gen9_pointer, gen9_count, gen9_stride) {
-            // The legacy info slot holds something else in this layout, so
-            // it is not reported as a declaration pointer.
+        let gen9_info = u64_le(raw, 0x38);
+        if let Some(mut data) = read_vertex_data(reader, gen9_pointer, gen9_count, gen9_stride) {
+            let mut declaration = None;
+            let mut g9_formats = [0u8; G9_FORMAT_COUNT];
+            if let Some(info_raw) = reader.resolve(gen9_info, G9_DECLARATION_SIZE) {
+                if let Some((parsed, formats, aos)) =
+                    parse_gen9_declaration(info_raw, gen9_stride, gen9_count, &data)
+                {
+                    declaration = Some(parsed);
+                    g9_formats = formats;
+                    if let Some(aos_data) = aos {
+                        data = aos_data;
+                    }
+                }
+            }
             return Some(VertexBuffer {
                 vertex_stride: gen9_stride,
                 vertex_count: gen9_count,
                 data_pointer: gen9_pointer,
-                info_pointer: 0,
-                declaration: None,
+                info_pointer: gen9_info,
+                declaration,
                 data,
                 layout: VertexBufferLayout::Gen9,
+                g9_formats,
             });
         }
     }
@@ -208,6 +234,7 @@ pub(crate) fn parse_vertex_buffer_at(
         declaration: None,
         data,
         layout: VertexBufferLayout::GeometryInline,
+        g9_formats: [0; G9_FORMAT_COUNT],
     })
 }
 
@@ -295,7 +322,7 @@ impl VertexDeclaration {
 }
 
 impl VertexSemantic {
-    fn from_index(index: u8) -> Self {
+    pub(crate) fn from_index(index: u8) -> Self {
         match index {
             0 => Self::Position,
             1 => Self::BlendWeights,
@@ -350,7 +377,7 @@ impl std::fmt::Display for VertexSemantic {
 }
 
 impl VertexComponentType {
-    fn from_nibble(value: u8) -> Self {
+    pub(crate) fn from_nibble(value: u8) -> Self {
         match value {
             0 => Self::Nothing,
             1 => Self::Half2,
@@ -367,7 +394,7 @@ impl VertexComponentType {
         }
     }
 
-    fn nibble(self) -> u8 {
+    pub(crate) fn nibble(self) -> u8 {
         match self {
             Self::Nothing => 0,
             Self::Half2 => 1,
@@ -535,7 +562,7 @@ impl VertexBuffer {
         }
 
         let base = vertex_index
-            .checked_mul(self.vertex_stride as usize)
+            .checked_mul(declaration.stride.max(1) as usize)
             .context("vertex attribute offset overflowed")?;
         let mut attributes = Vec::with_capacity(declaration.components.len());
 
@@ -721,6 +748,7 @@ mod tests {
             }),
             data,
             layout: VertexBufferLayout::Legacy,
+            g9_formats: [0; G9_FORMAT_COUNT],
         }
     }
 

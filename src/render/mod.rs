@@ -379,6 +379,7 @@ mod tests {
             declaration: with_declaration.then(declaration),
             data,
             layout: VertexBufferLayout::Legacy,
+            g9_formats: [0; crate::vertex::G9_FORMAT_COUNT],
         }
     }
 
