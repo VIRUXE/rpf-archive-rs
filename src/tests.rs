@@ -117,6 +117,62 @@ mod writer_tests {
         assert_eq!(archive.entries.iter().filter(|e| e.is_file()).count(), FILES.len());
     }
 
+    // Past 16 MiB the V7 entry's 24-bit size field can no longer hold the length.
+    const OVER_24_BITS: usize = 0x0100_0000 + 4096;
+
+    fn patterned(len: usize) -> Vec<u8> {
+        (0..len).map(|i| (i % 251) as u8).collect()
+    }
+
+    #[test]
+    fn v7_stored_binary_has_zero_disk_size() {
+        let mut builder = RpfBuilder::new(RpfEncryption::Open);
+        builder.add_file("hello.txt", b"Hello, world!".to_vec());
+        let bytes = builder.build(None).expect("build failed");
+        let archive = RpfArchive::parse(&bytes, "test.rpf", None).expect("parse failed");
+        let entry = archive.entries.iter().find(|e| e.name == "hello.txt").unwrap();
+        match entry.kind {
+            crate::archive::RpfEntryKind::BinaryFile { file_size, uncompressed_size, .. } => {
+                assert_eq!(file_size, 0, "stored entry must have on-disk size 0 (non-zero means compressed)");
+                assert_eq!(uncompressed_size, 13);
+            }
+            _ => panic!("expected a binary entry"),
+        }
+    }
+
+    #[test]
+    fn v7_binary_over_16mib_roundtrips() {
+        let data = patterned(OVER_24_BITS);
+        let mut builder = RpfBuilder::new(RpfEncryption::Open);
+        builder.add_file("big/nested.rpf", data.clone());
+        let bytes = builder.build(None).expect("build failed");
+        let archive = RpfArchive::parse(&bytes, "test.rpf", None).expect("parse failed");
+        let entry = archive.entries.iter().find(|e| e.name == "nested.rpf").unwrap();
+        let extracted = archive.extract_entry(&bytes, entry, None).expect("extract failed");
+        assert!(extracted == data, "content mismatch for a >16 MiB stored binary");
+    }
+
+    #[test]
+    fn v7_resource_over_16mib_roundtrips() {
+        let (sys, gfx) = (0x0000_0100u32, 0x0000_0200u32);
+        let body = patterned(OVER_24_BITS);
+        let mut data = Vec::with_capacity(16 + body.len());
+        data.extend_from_slice(&crate::archive::RSC7_MAGIC.to_le_bytes());
+        data.extend_from_slice(&13u32.to_le_bytes());
+        data.extend_from_slice(&sys.to_le_bytes());
+        data.extend_from_slice(&gfx.to_le_bytes());
+        data.extend_from_slice(&body);
+
+        let mut builder = RpfBuilder::new(RpfEncryption::Open);
+        builder.add_file("x64/big.ytd", data);
+        let bytes = builder.build(None).expect("build failed");
+        let archive = RpfArchive::parse(&bytes, "test.rpf", None).expect("parse failed");
+        let entry = archive.entries.iter().find(|e| e.name == "big.ytd").unwrap();
+        let extracted = archive.extract_entry(&bytes, entry, None).expect("extract failed");
+        assert_eq!(&extracted[8..16], &[sys.to_le_bytes(), gfx.to_le_bytes()].concat()[..]);
+        assert!(extracted[16..] == body[..], "body mismatch for a >16 MiB resource");
+    }
+
     #[test]
     fn empty_archive() {
         let builder = RpfBuilder::new(RpfEncryption::Open);
