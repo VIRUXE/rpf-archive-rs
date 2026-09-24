@@ -183,6 +183,28 @@ impl RpfBuilder {
             }
         }
 
+        // A resource too big for the 24-bit size field is written with the 0xFFFFFF
+        // sentinel; the real length goes into bytes 2, 5, 7 and 14 of its on-disk
+        // header, which is where the reader (and the game) look for it.
+        let mut file_idx = 0usize;
+        for entry in &flat {
+            match &entry.kind {
+                FlatKind::Resource { file_size, .. } => {
+                    if *file_size >= 0xFFFFFF {
+                        let n = *file_size;
+                        let hdr = &mut file_data[file_idx];
+                        hdr[2]  = (n >> 24) as u8;
+                        hdr[5]  = (n >> 16) as u8;
+                        hdr[7]  =  n        as u8;
+                        hdr[14] = (n >>  8) as u8;
+                    }
+                    file_idx += 1;
+                }
+                FlatKind::Binary { .. } => file_idx += 1,
+                FlatKind::Directory { .. } => {}
+            }
+        }
+
         // Encode entries
         let mut entries_buf = Vec::<u8>::with_capacity(flat.len() * 16);
         for entry in &flat {
@@ -193,12 +215,14 @@ impl RpfBuilder {
                     entries_buf.extend_from_slice(&entries_index.to_le_bytes());
                     entries_buf.extend_from_slice(&entries_count.to_le_bytes());
                 }
-                FlatKind::Binary { file_offset, file_size, uncompressed_size } => {
+                FlatKind::Binary { file_offset, file_size: _, uncompressed_size } => {
+                    // Binaries are stored, never compressed, and an on-disk size of 0
+                    // is how V7 says "stored" (the reader, CodeWalker and Rockstar's own
+                    // archives agree). Writing the length instead reads as a compressed
+                    // entry, and past 16 MiB it wraps the 24-bit field.
                     let no = entry.name_offset as u16;
                     entries_buf.extend_from_slice(&no.to_le_bytes());
-                    entries_buf.push((file_size & 0xFF) as u8);
-                    entries_buf.push(((file_size >> 8)  & 0xFF) as u8);
-                    entries_buf.push(((file_size >> 16) & 0xFF) as u8);
+                    entries_buf.extend_from_slice(&[0, 0, 0]);
                     entries_buf.push((file_offset & 0xFF) as u8);
                     entries_buf.push(((file_offset >> 8)  & 0xFF) as u8);
                     entries_buf.push(((file_offset >> 16) & 0xFF) as u8);
